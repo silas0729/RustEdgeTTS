@@ -28,3 +28,4 @@ identifier = "com.auralabs.edgettsstudio"
 category = "public.app-category.utilities"
 short_description = "Generate MP3 speech with Microsoft Edge voices"
 osx_minimum_system_version = "12.0"
+icon = ["assets/AppIcon.icns"]

@@ -3,12 +3,16 @@
 A lightweight Rust desktop GUI for macOS. It fetches Microsoft Edge Read Aloud
 voices, accepts multiline text, and writes synthesized speech to an MP3 file.
 The interface defaults to Chinese, can switch to English, supports bilingual
-voice search, and keeps long documents inside a dedicated scrollable editor.
+voice search, one-click macOS voice previews, speech-rate and volume controls,
+and keeps long documents inside a dedicated scrollable editor.
 
 ## Project structure
 
 ```text
 RustEdgeTTS/
+├── assets/
+│   ├── AppIcon.svg
+│   └── AppIcon.icns
 ├── Cargo.toml
 ├── Cargo.lock
 ├── README.md

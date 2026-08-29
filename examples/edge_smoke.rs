@@ -26,6 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "你好，这是 Edge TTS Studio 的连通性测试。",
             SpeakOptions {
                 voice: voice.short_name.clone(),
+                rate: "+15%".to_owned(),
+                volume: "+10%".to_owned(),
                 ..SpeakOptions::default()
             },
         )

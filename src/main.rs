@@ -46,10 +46,14 @@ enum WorkerCommand {
     Preview {
         text: String,
         voice: String,
+        rate_percent: i32,
+        volume_percent: i32,
     },
     Generate {
         text: String,
         voice: String,
+        rate_percent: i32,
+        volume_percent: i32,
         output_path: PathBuf,
     },
 }
@@ -348,6 +352,8 @@ struct TtsApp {
     selected_voice: Option<usize>,
     voice_filter: String,
     text: String,
+    rate_percent: i32,
+    volume_percent: i32,
     ui_language: UiLanguage,
     fetching_voices: bool,
     previewing: bool,
@@ -389,6 +395,8 @@ impl TtsApp {
             selected_voice: None,
             voice_filter: String::new(),
             text: DEFAULT_TEXT.to_owned(),
+            rate_percent: 0,
+            volume_percent: 0,
             ui_language: UiLanguage::Chinese,
             fetching_voices,
             previewing: false,
@@ -594,6 +602,8 @@ impl TtsApp {
         match self.command_tx.send(WorkerCommand::Generate {
             text,
             voice,
+            rate_percent: self.rate_percent,
+            volume_percent: self.volume_percent,
             output_path,
         }) {
             Ok(()) => {
@@ -633,7 +643,12 @@ impl TtsApp {
         };
 
         let text = preview_text(&self.text, self.ui_language);
-        match self.command_tx.send(WorkerCommand::Preview { text, voice }) {
+        match self.command_tx.send(WorkerCommand::Preview {
+            text,
+            voice,
+            rate_percent: self.rate_percent,
+            volume_percent: self.volume_percent,
+        }) {
             Ok(()) => {
                 self.previewing = true;
                 self.status = Some(StatusMessage::new(
@@ -702,7 +717,7 @@ impl eframe::App for TtsApp {
                         let voice_width = (total_width * 0.39).clamp(360.0, 420.0);
                         let text_width = (total_width - voice_width - gap).max(420.0);
 
-                        ui.horizontal(|ui| {
+                        ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = gap;
                             ui.allocate_ui_with_layout(
                                 egui::vec2(voice_width, workspace_height),
@@ -818,7 +833,11 @@ impl TtsApp {
                         self.reload_voices();
                     }
                     if self.fetching_voices {
-                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(language.text("加载中…", "Loading…"))
+                                .size(11.0)
+                                .color(PRIMARY),
+                        );
                     }
                 });
             });
@@ -924,8 +943,54 @@ impl TtsApp {
                     .color(TEXT_SECONDARY),
             );
 
-            ui.add_space(16.0);
-            let preview_panel_height = ui.available_height().max(150.0);
+            ui.add_space(12.0);
+            egui::Frame::new()
+                .fill(EDITOR_BACKGROUND)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.spacing_mut().interact_size.y = 26.0;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(language.text("声音设置", "Speech settings"))
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let reset = egui::Button::new(
+                                egui::RichText::new(language.text("恢复默认", "Reset"))
+                                    .size(11.0)
+                                    .color(PRIMARY),
+                            )
+                            .fill(CARD_BACKGROUND)
+                            .stroke(egui::Stroke::new(1.0, BORDER))
+                            .corner_radius(7)
+                            .min_size(egui::vec2(70.0, 24.0));
+                            if ui.add(reset).clicked() {
+                                self.rate_percent = 0;
+                                self.volume_percent = 0;
+                            }
+                        });
+                    });
+                    adjustment_row(
+                        ui,
+                        language.text("语速", "Speed"),
+                        &mut self.rate_percent,
+                        -50..=100,
+                    );
+                    adjustment_row(
+                        ui,
+                        language.text("音量", "Volume"),
+                        &mut self.volume_percent,
+                        -100..=100,
+                    );
+                });
+
+            ui.add_space(12.0);
+            let preview_panel_height = ui.available_height().max(112.0);
             egui::Frame::new()
                 .fill(PRIMARY_SOFT)
                 .stroke(egui::Stroke::new(
@@ -933,32 +998,35 @@ impl TtsApp {
                     egui::Color32::from_rgb(213, 220, 255),
                 ))
                 .corner_radius(11)
-                .inner_margin(egui::Margin::same(14))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
-                    ui.set_min_height((preview_panel_height - 28.0).max(0.0));
-                    ui.label(
-                        egui::RichText::new(language.text("试听音色", "Voice preview"))
-                            .size(14.0)
-                            .strong()
-                            .color(TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        egui::RichText::new(language.text(
-                            "使用输入文本的前 80 个字符试听",
-                            "Preview the first 80 characters of your text",
-                        ))
-                        .size(12.0)
-                        .color(TEXT_SECONDARY),
-                    );
-                    ui.add_space(8.0);
+                    ui.set_min_height((preview_panel_height - 20.0).max(0.0));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(language.text("试听音色", "Voice preview"))
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    language.text("取正文前 80 字符", "First 80 characters"),
+                                )
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
 
-                    let waveform_height = (ui.available_height() - 52.0).clamp(52.0, 104.0);
+                    let waveform_height = (ui.available_height() - 44.0).clamp(24.0, 40.0);
                     let (waveform_rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), waveform_height),
                         egui::Sense::hover(),
                     );
                     paint_preview_waveform(ui, waveform_rect, self.previewing);
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
 
                     let can_preview = !busy && self.selected_voice.is_some();
                     let preview_label = if self.previewing {
@@ -986,7 +1054,7 @@ impl TtsApp {
                         egui::Stroke::new(1.0, BORDER)
                     })
                     .corner_radius(9)
-                    .min_size(egui::vec2(ui.available_width(), 38.0));
+                    .min_size(egui::vec2(ui.available_width(), 34.0));
 
                     if ui.add(preview_button).clicked() && can_preview {
                         self.start_preview();
@@ -1261,6 +1329,86 @@ fn preview_text(text: &str, language: UiLanguage) -> String {
     preview
 }
 
+fn signed_percent(value: i32) -> String {
+    format!("{value:+}%")
+}
+
+fn adjustment_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+) {
+    ui.horizontal(|ui| {
+        ui.style_mut().visuals.handle_shape = egui::style::HandleShape::Circle;
+        ui.spacing_mut().slider_rail_height = 4.0;
+        ui.visuals_mut().widgets.inactive.bg_fill = CARD_BACKGROUND;
+        ui.visuals_mut().widgets.inactive.fg_stroke = egui::Stroke::new(1.5, PRIMARY);
+        ui.visuals_mut().widgets.hovered.bg_fill = CARD_BACKGROUND;
+        ui.visuals_mut().widgets.hovered.fg_stroke = egui::Stroke::new(1.8, PRIMARY);
+        ui.visuals_mut().widgets.active.bg_fill = PRIMARY_SOFT;
+        ui.visuals_mut().widgets.active.fg_stroke = egui::Stroke::new(1.8, PRIMARY);
+
+        ui.add_sized(
+            [46.0, 24.0],
+            egui::Label::new(egui::RichText::new(label).size(12.0).color(TEXT_SECONDARY)),
+        );
+        let slider_width = (ui.available_width() - 56.0).max(64.0);
+        ui.add_sized(
+            [slider_width, 24.0],
+            egui::Slider::new(value, range)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        ui.add_sized(
+            [48.0, 24.0],
+            egui::Label::new(
+                egui::RichText::new(signed_percent(*value))
+                    .size(12.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            ),
+        );
+    });
+}
+
+fn paint_preview_waveform(ui: &egui::Ui, rect: egui::Rect, active: bool) {
+    const LEVELS: &[f32] = &[
+        0.24, 0.42, 0.68, 0.48, 0.82, 0.58, 1.0, 0.72, 0.44, 0.76, 0.54, 0.88, 0.6, 0.38, 0.22,
+    ];
+
+    let total_width = rect.width().min(220.0);
+    let gap = 5.0;
+    let bar_width =
+        ((total_width - gap * (LEVELS.len() - 1) as f32) / LEVELS.len() as f32).clamp(2.0, 6.0);
+    let used_width = bar_width * LEVELS.len() as f32 + gap * (LEVELS.len() - 1) as f32;
+    let start_x = rect.center().x - used_width / 2.0;
+    let time = ui.input(|input| input.time) as f32;
+    let color = if active {
+        PRIMARY
+    } else {
+        egui::Color32::from_rgb(165, 176, 245)
+    };
+
+    for (index, level) in LEVELS.iter().enumerate() {
+        let pulse = if active {
+            0.68 + 0.32 * (time * 5.0 + index as f32 * 0.72).sin().abs()
+        } else {
+            1.0
+        };
+        let height = (rect.height() * level * pulse).max(4.0);
+        let center = egui::pos2(
+            start_x + index as f32 * (bar_width + gap) + bar_width / 2.0,
+            rect.center().y,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(center, egui::vec2(bar_width, height)),
+            egui::CornerRadius::same(2),
+            color,
+        );
+    }
+}
+
 fn language_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     ui.add(
         egui::Button::new(
@@ -1328,15 +1476,39 @@ fn spawn_tts_worker() -> (
                         WorkerCommand::FetchVoices => {
                             fetch_voices(&client, &thread_event_tx, &cache_path).await;
                         }
-                        WorkerCommand::Preview { text, voice } => {
-                            preview_voice(&client, &thread_event_tx, text, voice).await;
+                        WorkerCommand::Preview {
+                            text,
+                            voice,
+                            rate_percent,
+                            volume_percent,
+                        } => {
+                            preview_voice(
+                                &client,
+                                &thread_event_tx,
+                                text,
+                                voice,
+                                rate_percent,
+                                volume_percent,
+                            )
+                            .await;
                         }
                         WorkerCommand::Generate {
                             text,
                             voice,
+                            rate_percent,
+                            volume_percent,
                             output_path,
                         } => {
-                            generate_mp3(&client, &thread_event_tx, text, voice, output_path).await;
+                            generate_mp3(
+                                &client,
+                                &thread_event_tx,
+                                text,
+                                voice,
+                                rate_percent,
+                                volume_percent,
+                                output_path,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1355,9 +1527,13 @@ async fn preview_voice(
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
     text: String,
     voice: String,
+    rate_percent: i32,
+    volume_percent: i32,
 ) {
     let options = SpeakOptions {
         voice,
+        rate: signed_percent(rate_percent),
+        volume: signed_percent(volume_percent),
         ..SpeakOptions::default()
     };
 
@@ -1486,10 +1662,14 @@ async fn generate_mp3(
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
     text: String,
     voice: String,
+    rate_percent: i32,
+    volume_percent: i32,
     output_path: PathBuf,
 ) {
     let options = SpeakOptions {
         voice,
+        rate: signed_percent(rate_percent),
+        volume: signed_percent(volume_percent),
         ..SpeakOptions::default()
     };
 
@@ -1679,5 +1859,8 @@ mod tests {
             preview_text("   ", UiLanguage::English),
             "Hello, this is a preview of the selected voice."
         );
+        assert_eq!(signed_percent(-25), "-25%");
+        assert_eq!(signed_percent(0), "+0%");
+        assert_eq!(signed_percent(80), "+80%");
     }
 }
