@@ -10,7 +10,12 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+mod subtitle_pipeline;
+mod subtitles;
 mod system_proxy;
+mod timeline_audio;
+
+use subtitles::{SubtitleCue, SubtitleTrack, format_timestamp, parse_subtitle};
 
 const APP_NAME: &str = "Edge TTS Studio";
 const DEFAULT_TEXT: &str = "你好！欢迎使用 Edge TTS 语音工作室。\n\n请在这里输入或粘贴中英文文本，选择喜欢的音色，然后生成 MP3 音频。";
@@ -56,6 +61,13 @@ enum WorkerCommand {
         volume_percent: i32,
         output_path: PathBuf,
     },
+    GenerateSubtitles {
+        cues: Vec<SubtitleCue>,
+        voice: String,
+        rate_percent: i32,
+        volume_percent: i32,
+        output_path: PathBuf,
+    },
 }
 
 /// Results travel back to egui. The UI polls this channel without blocking.
@@ -72,8 +84,29 @@ enum WorkerEvent {
         output_path: PathBuf,
         byte_count: usize,
     },
+    SubtitleProgress {
+        current: usize,
+        total: usize,
+    },
+    SubtitleGenerationFinished {
+        output_path: PathBuf,
+        byte_count: usize,
+        adjusted_count: usize,
+        truncated_count: usize,
+    },
     GenerationFailed(String),
     WorkerFailed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputMode {
+    Text,
+    Subtitles,
+}
+
+enum GenerationContent {
+    Text(String),
+    Subtitles(Vec<SubtitleCue>),
 }
 
 /// A small serializable UI model. Keeping the Edge crate's network model out of
@@ -352,6 +385,10 @@ struct TtsApp {
     selected_voice: Option<usize>,
     voice_filter: String,
     text: String,
+    input_mode: InputMode,
+    subtitle_track: Option<SubtitleTrack>,
+    subtitle_path: Option<PathBuf>,
+    subtitle_progress: Option<(usize, usize)>,
     rate_percent: i32,
     volume_percent: i32,
     ui_language: UiLanguage,
@@ -395,6 +432,10 @@ impl TtsApp {
             selected_voice: None,
             voice_filter: String::new(),
             text: DEFAULT_TEXT.to_owned(),
+            input_mode: InputMode::Text,
+            subtitle_track: None,
+            subtitle_path: None,
+            subtitle_progress: None,
             rate_percent: 0,
             volume_percent: 0,
             ui_language: UiLanguage::Chinese,
@@ -489,6 +530,7 @@ impl TtsApp {
                     byte_count,
                 } => {
                     self.generating = false;
+                    self.subtitle_progress = None;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Success,
                         format!(
@@ -503,8 +545,44 @@ impl TtsApp {
                         ),
                     ));
                 }
+                WorkerEvent::SubtitleProgress { current, total } => {
+                    self.subtitle_progress = Some((current, total));
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        format!("正在合成第 {current}/{total} 条字幕…"),
+                        format!("Synthesizing subtitle {current} of {total}…"),
+                    ));
+                }
+                WorkerEvent::SubtitleGenerationFinished {
+                    output_path,
+                    byte_count,
+                    adjusted_count,
+                    truncated_count,
+                } => {
+                    self.generating = false;
+                    self.subtitle_progress = None;
+                    let kind = if truncated_count > 0 {
+                        StatusKind::Warning
+                    } else {
+                        StatusKind::Success
+                    };
+                    self.status = Some(StatusMessage::new(
+                        kind,
+                        format!(
+                            "字幕音频已保存（{:.1} KB）；自动调速 {adjusted_count} 条，截断 {truncated_count} 条：{}",
+                            byte_count as f64 / 1024.0,
+                            output_path.display()
+                        ),
+                        format!(
+                            "Saved subtitle audio ({:.1} KB); {adjusted_count} cues auto-fitted and {truncated_count} truncated: {}",
+                            byte_count as f64 / 1024.0,
+                            output_path.display()
+                        ),
+                    ));
+                }
                 WorkerEvent::GenerationFailed(error) => {
                     self.generating = false;
+                    self.subtitle_progress = None;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Error,
                         format!("生成语音失败：{error}"),
@@ -515,6 +593,7 @@ impl TtsApp {
                     self.fetching_voices = false;
                     self.previewing = false;
                     self.generating = false;
+                    self.subtitle_progress = None;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Error,
                         format!("语音服务异常：{error}"),
@@ -554,16 +633,6 @@ impl TtsApp {
             return;
         }
 
-        let text = self.text.trim().to_owned();
-        if text.is_empty() {
-            self.status = Some(StatusMessage::new(
-                StatusKind::Error,
-                "请先输入需要转换的文字。",
-                "Enter some text before generating audio.",
-            ));
-            return;
-        }
-
         let Some(voice) = self
             .selected_voice
             .and_then(|index| self.voices.get(index))
@@ -577,6 +646,39 @@ impl TtsApp {
             return;
         };
 
+        let (command_content, default_file_name) = match self.input_mode {
+            InputMode::Text => {
+                let text = self.text.trim().to_owned();
+                if text.is_empty() {
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Error,
+                        "请先输入需要转换的文字。",
+                        "Enter some text before generating audio.",
+                    ));
+                    return;
+                }
+                (
+                    GenerationContent::Text(text),
+                    self.ui_language.text("语音合成.mp3", "edge-tts-output.mp3"),
+                )
+            }
+            InputMode::Subtitles => {
+                let Some(track) = &self.subtitle_track else {
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Error,
+                        "请先导入 SRT/STR、WebVTT、ASS/SSA 或 LRC 字幕。",
+                        "Import an SRT/STR, WebVTT, ASS/SSA, or LRC subtitle first.",
+                    ));
+                    return;
+                };
+                (
+                    GenerationContent::Subtitles(track.cues.clone()),
+                    self.ui_language
+                        .text("字幕配音.mp3", "subtitle-voiceover.mp3"),
+                )
+            }
+        };
+
         // rfd uses macOS's native NSSavePanel. It is intentionally opened on
         // the UI thread; network work and file writing remain on Tokio.
         let Some(output_path) = rfd::FileDialog::new()
@@ -584,7 +686,7 @@ impl TtsApp {
                 self.ui_language
                     .text("保存生成的语音", "Save generated speech"),
             )
-            .set_file_name(self.ui_language.text("语音合成.mp3", "edge-tts-output.mp3"))
+            .set_file_name(default_file_name)
             .set_can_create_directories(true)
             .add_filter(self.ui_language.text("MP3 音频", "MP3 audio"), &["mp3"])
             .save_file()
@@ -599,15 +701,32 @@ impl TtsApp {
             .unwrap_or("MP3 file")
             .to_owned();
 
-        match self.command_tx.send(WorkerCommand::Generate {
-            text,
-            voice,
-            rate_percent: self.rate_percent,
-            volume_percent: self.volume_percent,
-            output_path,
-        }) {
+        let command = match command_content {
+            GenerationContent::Text(text) => WorkerCommand::Generate {
+                text,
+                voice,
+                rate_percent: self.rate_percent,
+                volume_percent: self.volume_percent,
+                output_path,
+            },
+            GenerationContent::Subtitles(cues) => WorkerCommand::GenerateSubtitles {
+                cues,
+                voice,
+                rate_percent: self.rate_percent,
+                volume_percent: self.volume_percent,
+                output_path,
+            },
+        };
+
+        match self.command_tx.send(command) {
             Ok(()) => {
                 self.generating = true;
+                self.subtitle_progress = match &self.subtitle_track {
+                    Some(track) if self.input_mode == InputMode::Subtitles => {
+                        Some((0, track.cues.len()))
+                    }
+                    _ => None,
+                };
                 self.status = Some(StatusMessage::new(
                     StatusKind::Info,
                     format!("正在生成 {file_name}…"),
@@ -619,6 +738,64 @@ impl TtsApp {
                     StatusKind::Error,
                     "语音服务已停止，请重新启动应用。",
                     "The TTS worker is no longer running.",
+                ));
+            }
+        }
+    }
+
+    fn import_subtitle(&mut self) {
+        if self.generating || self.previewing {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(
+                self.ui_language
+                    .text("导入字幕文件", "Import subtitle file"),
+            )
+            .add_filter(
+                self.ui_language.text("支持的字幕", "Supported subtitles"),
+                &["srt", "str", "vtt", "ass", "ssa", "lrc"],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+
+        let result = std::fs::read(&path)
+            .map_err(|error| format!("Could not read the subtitle file: {error}"))
+            .and_then(|bytes| parse_subtitle(&path, &bytes));
+        match result {
+            Ok(track) if track.cues.len() > 10_000 => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "字幕超过 10,000 条，为避免误操作未导入。",
+                    "The subtitle has more than 10,000 cues and was not imported.",
+                ));
+            }
+            Ok(track) if track.duration_ms() > 24 * 60 * 60 * 1_000 => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "字幕时间轴超过 24 小时，为避免异常文件未导入。",
+                    "The subtitle timeline exceeds 24 hours and was not imported.",
+                ));
+            }
+            Ok(track) => {
+                let cue_count = track.cues.len();
+                let format = track.format.label();
+                self.subtitle_track = Some(track);
+                self.subtitle_path = Some(path);
+                self.input_mode = InputMode::Subtitles;
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Success,
+                    format!("已导入 {format} 字幕，共 {cue_count} 条。"),
+                    format!("Imported {cue_count} {format} subtitle cues."),
+                ));
+            }
+            Err(error) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    format!("导入字幕失败：{error}"),
+                    format!("Could not import subtitles: {error}"),
                 ));
             }
         }
@@ -642,7 +819,16 @@ impl TtsApp {
             return;
         };
 
-        let text = preview_text(&self.text, self.ui_language);
+        let source_text = if self.input_mode == InputMode::Subtitles {
+            self.subtitle_track
+                .as_ref()
+                .and_then(|track| track.cues.first())
+                .map(|cue| cue.text.as_str())
+                .unwrap_or_default()
+        } else {
+            &self.text
+        };
+        let text = preview_text(source_text, self.ui_language);
         match self.command_tx.send(WorkerCommand::Preview {
             text,
             voice,
@@ -1069,98 +1255,347 @@ impl TtsApp {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new(language.text("输入文本", "Enter text"))
+                        egui::RichText::new(language.text("配音内容", "Voiceover content"))
                             .size(17.0)
                             .strong()
                             .color(TEXT_PRIMARY),
                     );
                     ui.label(
                         egui::RichText::new(language.text(
-                            "可输入或粘贴中文、英文及混合内容",
-                            "Type or paste Chinese, English, or mixed text",
+                            "输入文字，或导入字幕按时间轴生成音频",
+                            "Enter text, or import subtitles for timed audio",
                         ))
                         .size(13.0)
                         .color(TEXT_SECONDARY),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let count = self.text.chars().count();
-                    ui.label(
-                        egui::RichText::new(if language == UiLanguage::Chinese {
-                            format!("{count} 字符")
-                        } else {
-                            format!("{count} characters")
-                        })
-                        .size(12.0)
-                        .color(TEXT_SECONDARY),
-                    );
-                    let clear = egui::Button::new(
-                        egui::RichText::new(language.text("清空文本", "Clear text"))
+                    let import = egui::Button::new(
+                        egui::RichText::new(language.text("＋ 导入字幕", "+ Import subtitles"))
                             .size(12.0)
-                            .color(TEXT_SECONDARY),
+                            .strong()
+                            .color(PRIMARY),
                     )
-                    .fill(egui::Color32::from_rgb(247, 249, 253))
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .fill(PRIMARY_SOFT)
+                    .stroke(egui::Stroke::NONE)
                     .corner_radius(8)
-                    .min_size(egui::vec2(84.0, 30.0));
-                    if ui
-                        .add_enabled(!self.text.is_empty() && !self.generating, clear)
-                        .on_hover_text(language.text("清空全部文本", "Clear all text"))
-                        .clicked()
-                    {
-                        self.text.clear();
+                    .min_size(egui::vec2(108.0, 32.0));
+                    if ui.add_enabled(!self.generating, import).clicked() {
+                        self.import_subtitle();
                     }
                 });
             });
 
-            ui.add_space(12.0);
-            let editor_height = (ui.available_height() - 16.0).max(220.0);
+            ui.add_space(11.0);
             egui::Frame::new()
                 .fill(EDITOR_BACKGROUND)
                 .stroke(egui::Stroke::new(1.0, BORDER))
-                .corner_radius(9)
-                .inner_margin(egui::Margin::same(8))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::same(4))
                 .show(ui, |ui| {
-                    // The editor is inside its own fixed-height ScrollArea. Long
-                    // documents scroll here instead of stretching the whole app.
-                    egui::ScrollArea::vertical()
-                        .id_salt("text-editor-scroll")
-                        .max_height(editor_height)
-                        .min_scrolled_height(editor_height)
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
-                        )
-                        .show(ui, |ui| {
-                            ui.add_enabled(
-                                !self.generating,
-                                egui::TextEdit::multiline(&mut self.text)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(10)
-                                    .cursor_at_end(false)
-                                    .frame(egui::Frame::NONE)
-                                    .margin(egui::Margin::symmetric(4, 3))
-                                    .text_color(TEXT_PRIMARY)
-                                    .hint_text(language.text(
-                                        "在这里输入或粘贴需要转换的文字…",
-                                        "Type or paste the text to synthesize…",
-                                    )),
-                            );
-                        });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let mode_width = ((ui.available_width() - 4.0) / 2.0).max(100.0);
+                        let text_button = mode_button(
+                            ui,
+                            language.text("普通文本", "Plain text"),
+                            self.input_mode == InputMode::Text,
+                            mode_width,
+                        );
+                        let subtitle_button = mode_button(
+                            ui,
+                            language.text("字幕时间轴", "Subtitle timeline"),
+                            self.input_mode == InputMode::Subtitles,
+                            mode_width,
+                        );
+                        if text_button.clicked() && !self.generating {
+                            self.input_mode = InputMode::Text;
+                        }
+                        if subtitle_button.clicked() && !self.generating {
+                            self.input_mode = InputMode::Subtitles;
+                        }
+                    });
                 });
+
+            ui.add_space(10.0);
+            match self.input_mode {
+                InputMode::Text => self.show_plain_text_editor(ui, language),
+                InputMode::Subtitles => self.show_subtitle_editor(ui, language),
+            }
         });
     }
 
+    fn show_plain_text_editor(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        ui.horizontal(|ui| {
+            let count = self.text.chars().count();
+            ui.label(
+                egui::RichText::new(if language == UiLanguage::Chinese {
+                    format!("{count} 字符")
+                } else {
+                    format!("{count} characters")
+                })
+                .size(12.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clear = egui::Button::new(
+                    egui::RichText::new(language.text("清空文本", "Clear text"))
+                        .size(12.0)
+                        .color(TEXT_SECONDARY),
+                )
+                .fill(egui::Color32::from_rgb(247, 249, 253))
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(8)
+                .min_size(egui::vec2(84.0, 30.0));
+                if ui
+                    .add_enabled(!self.text.is_empty() && !self.generating, clear)
+                    .on_hover_text(language.text("清空全部文本", "Clear all text"))
+                    .clicked()
+                {
+                    self.text.clear();
+                }
+            });
+        });
+
+        ui.add_space(7.0);
+        let editor_height = ui.available_height().max(190.0);
+        egui::Frame::new()
+            .fill(EDITOR_BACKGROUND)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(9)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                // Long documents scroll only inside the editor; the app itself
+                // stays fixed and never gains an outer scrollbar.
+                egui::ScrollArea::vertical()
+                    .id_salt("text-editor-scroll")
+                    .max_height(editor_height)
+                    .min_scrolled_height(editor_height)
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .show(ui, |ui| {
+                        ui.add_enabled(
+                            !self.generating,
+                            egui::TextEdit::multiline(&mut self.text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(10)
+                                .cursor_at_end(false)
+                                .frame(egui::Frame::NONE)
+                                .margin(egui::Margin::symmetric(4, 3))
+                                .text_color(TEXT_PRIMARY)
+                                .hint_text(language.text(
+                                    "在这里输入或粘贴需要转换的文字…",
+                                    "Type or paste the text to synthesize…",
+                                )),
+                        );
+                    });
+            });
+    }
+
+    fn show_subtitle_editor(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        let Some(track) = self.subtitle_track.as_ref() else {
+            let available = ui.available_size();
+            egui::Frame::new()
+                .fill(EDITOR_BACKGROUND)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.set_min_size(available - egui::vec2(36.0, 36.0));
+                    ui.with_layout(
+                        egui::Layout::top_down(egui::Align::Center)
+                            .with_main_align(egui::Align::Center),
+                        |ui| {
+                            ui.label(egui::RichText::new("CC").size(28.0).strong().color(PRIMARY));
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(language.text(
+                                    "导入字幕后按每条时间间隔生成完整音轨",
+                                    "Import subtitles to build a fully timed audio track",
+                                ))
+                                .size(14.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(language.text(
+                                    "支持 SRT/STR、WebVTT、ASS/SSA、LRC · UTF-8 / UTF-16 / GBK",
+                                    "SRT/STR, WebVTT, ASS/SSA, LRC · UTF-8 / UTF-16 / GBK",
+                                ))
+                                .size(12.0)
+                                .color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(10.0);
+                            let import = egui::Button::new(
+                                egui::RichText::new(
+                                    language.text("选择字幕文件", "Choose subtitle file"),
+                                )
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                            )
+                            .fill(PRIMARY)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(9)
+                            .min_size(egui::vec2(142.0, 38.0));
+                            if ui.add(import).clicked() {
+                                self.import_subtitle();
+                            }
+                        },
+                    );
+                });
+            return;
+        };
+
+        let file_name = self
+            .subtitle_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("subtitle")
+            .to_owned();
+        let format = track.format.label();
+        let cue_count = track.cues.len();
+        let duration = format_timestamp(track.duration_ms());
+        let mut remove_subtitle = false;
+
+        egui::Frame::new()
+            .fill(PRIMARY_SOFT)
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(213, 220, 255),
+            ))
+            .corner_radius(9)
+            .inner_margin(egui::Margin::symmetric(11, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(file_name)
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.label(
+                            egui::RichText::new(if language == UiLanguage::Chinese {
+                                format!("{format} · {cue_count} 条 · 总时长 {duration}")
+                            } else {
+                                format!("{format} · {cue_count} cues · {duration} total")
+                            })
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let remove = egui::Button::new(
+                            egui::RichText::new(language.text("移除", "Remove"))
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        )
+                        .fill(CARD_BACKGROUND)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .corner_radius(7)
+                        .min_size(egui::vec2(62.0, 28.0));
+                        remove_subtitle = ui.add_enabled(!self.generating, remove).clicked();
+                    });
+                });
+            });
+
+        if remove_subtitle {
+            self.subtitle_track = None;
+            self.subtitle_path = None;
+            return;
+        }
+
+        ui.add_space(8.0);
+        let list_height = ui.available_height().max(150.0);
+        let track = self
+            .subtitle_track
+            .as_ref()
+            .expect("subtitle track exists after the remove check");
+        egui::Frame::new()
+            .fill(EDITOR_BACKGROUND)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(9)
+            .inner_margin(egui::Margin::symmetric(9, 7))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("subtitle-cue-scroll")
+                    .max_height(list_height)
+                    .min_scrolled_height(list_height)
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .show(ui, |ui| {
+                        for (index, cue) in track.cues.iter().enumerate() {
+                            ui.horizontal_top(|ui| {
+                                ui.add_sized(
+                                    [34.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{}", index + 1))
+                                            .size(11.0)
+                                            .color(TEXT_SECONDARY),
+                                    ),
+                                );
+                                ui.add_sized(
+                                    [150.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "{} – {}",
+                                            format_timestamp(cue.start_ms),
+                                            format_timestamp(cue.end_ms)
+                                        ))
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(PRIMARY),
+                                    ),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&cue.text)
+                                            .size(12.0)
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                            if index + 1 < track.cues.len() {
+                                ui.separator();
+                            }
+                        }
+                    });
+            });
+    }
+
     fn show_generate_area(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        let has_content = match self.input_mode {
+            InputMode::Text => !self.text.trim().is_empty(),
+            InputMode::Subtitles => self
+                .subtitle_track
+                .as_ref()
+                .is_some_and(|track| !track.cues.is_empty()),
+        };
         let can_generate = !self.generating
             && !self.previewing
             && !self.fetching_voices
             && self.selected_voice.is_some()
-            && !self.text.trim().is_empty();
+            && has_content;
 
         ui.horizontal(|ui| {
+            let generate_label = match (self.generating, self.input_mode) {
+                (true, InputMode::Subtitles) => {
+                    language.text("正在生成字幕音频…", "Generating timed audio…")
+                }
+                (false, InputMode::Subtitles) => {
+                    language.text("生成字幕 MP3", "Generate subtitle MP3")
+                }
+                (true, InputMode::Text) => language.text("正在生成…", "Generating…"),
+                (false, InputMode::Text) => language.text("生成 MP3", "Generate MP3"),
+            };
             let button = egui::Button::new(
-                egui::RichText::new(language.text("生成 MP3", "Generate MP3"))
+                egui::RichText::new(generate_label)
                     .size(15.0)
                     .strong()
                     .color(egui::Color32::WHITE),
@@ -1176,9 +1611,17 @@ impl TtsApp {
             if self.generating {
                 ui.spinner();
                 ui.label(
-                    egui::RichText::new(
-                        language.text("正在合成并保存…", "Synthesizing and saving…"),
-                    )
+                    egui::RichText::new(if let Some((current, total)) = self.subtitle_progress {
+                        if language == UiLanguage::Chinese {
+                            format!("正在合成第 {current}/{total} 条字幕")
+                        } else {
+                            format!("Synthesizing subtitle {current}/{total}")
+                        }
+                    } else {
+                        language
+                            .text("正在合成并保存…", "Synthesizing and saving…")
+                            .to_owned()
+                    })
                     .color(TEXT_SECONDARY),
                 );
             }
@@ -1432,6 +1875,29 @@ fn language_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Resp
     )
 }
 
+fn mode_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.0)
+                .strong()
+                .color(if selected { PRIMARY } else { TEXT_SECONDARY }),
+        )
+        .fill(if selected {
+            CARD_BACKGROUND
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(if selected {
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(216, 223, 245))
+        } else {
+            egui::Stroke::NONE
+        })
+        .corner_radius(8)
+        .min_size(egui::vec2(width, 32.0)),
+    )
+}
+
 fn spawn_tts_worker() -> (
     mpsc::UnboundedSender<WorkerCommand>,
     mpsc::UnboundedReceiver<WorkerEvent>,
@@ -1503,6 +1969,24 @@ fn spawn_tts_worker() -> (
                                 &client,
                                 &thread_event_tx,
                                 text,
+                                voice,
+                                rate_percent,
+                                volume_percent,
+                                output_path,
+                            )
+                            .await;
+                        }
+                        WorkerCommand::GenerateSubtitles {
+                            cues,
+                            voice,
+                            rate_percent,
+                            volume_percent,
+                            output_path,
+                        } => {
+                            generate_subtitle_mp3(
+                                &client,
+                                &thread_event_tx,
+                                cues,
                                 voice,
                                 rate_percent,
                                 volume_percent,
@@ -1693,6 +2177,52 @@ async fn generate_mp3(
         Err(error) => {
             let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
                 "Could not generate speech: {error}"
+            )));
+        }
+    }
+}
+
+async fn generate_subtitle_mp3(
+    client: &EdgeTtsClient,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cues: Vec<SubtitleCue>,
+    voice: String,
+    rate_percent: i32,
+    volume_percent: i32,
+    output_path: PathBuf,
+) {
+    let progress_tx = event_tx.clone();
+    let report = match subtitle_pipeline::generate_subtitle_audio(
+        client,
+        &cues,
+        &voice,
+        rate_percent,
+        volume_percent,
+        move |current, total| {
+            let _ = progress_tx.send(WorkerEvent::SubtitleProgress { current, total });
+        },
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+    };
+    let byte_count = report.mp3.len();
+    match tokio::fs::write(&output_path, report.mp3).await {
+        Ok(()) => {
+            let _ = event_tx.send(WorkerEvent::SubtitleGenerationFinished {
+                output_path,
+                byte_count,
+                adjusted_count: report.adjusted_count,
+                truncated_count: report.truncated_count,
+            });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
+                "The subtitle audio was generated, but the MP3 file could not be saved: {error}"
             )));
         }
     }

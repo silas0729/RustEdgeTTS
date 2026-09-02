@@ -4,7 +4,9 @@ A lightweight Rust desktop GUI for macOS. It fetches Microsoft Edge Read Aloud
 voices, accepts multiline text, and writes synthesized speech to an MP3 file.
 The interface defaults to Chinese, can switch to English, supports bilingual
 voice search, one-click macOS voice previews, speech-rate and volume controls,
-and keeps long documents inside a dedicated scrollable editor.
+and keeps long documents inside a dedicated scrollable editor. It can also
+import SRT (including `.str`-named files), WebVTT, ASS/SSA, and LRC subtitles and build an MP3 whose silence
+and speech follow the authored cue timings.
 
 ## Project structure
 
@@ -17,10 +19,14 @@ RustEdgeTTS/
 ├── Cargo.lock
 ├── README.md
 ├── examples/
-│   └── edge_smoke.rs
+│   ├── edge_smoke.rs
+│   └── subtitle_smoke.rs
 └── src/
-    ├── main.rs
-    └── system_proxy.rs
+    ├── main.rs                 # egui UI and Tokio channel worker
+    ├── subtitle_pipeline.rs    # asynchronous per-cue TTS orchestration
+    ├── subtitles.rs            # SRT/VTT/ASS/SSA/LRC and text encodings
+    ├── system_proxy.rs
+    └── timeline_audio.rs       # streaming silence/timeline MP3 assembly
 ```
 
 ## Run on macOS
@@ -56,10 +62,12 @@ Compile, run unit tests, and perform a real Edge TTS network/synthesis check:
 cargo check
 cargo test
 cargo run --example edge_smoke
+cargo run --example subtitle_smoke
 ```
 
-The live smoke test writes `edge-tts-studio-smoke-test.mp3` into the macOS
-temporary directory and prints its exact location.
+The live smoke tests write their MP3 results into the macOS temporary directory
+and print the exact locations. `subtitle_smoke` also decodes the final file and
+checks that its duration matches the eight-second test timeline.
 
 ## Optional `.app` bundle
 
@@ -78,6 +86,13 @@ and MP3 writing run in the background. A dedicated OS thread owns a two-thread
 Tokio runtime and a reusable `EdgeTtsClient`. Two `tokio::sync::mpsc` channels
 carry commands to that worker and results back to the UI. The UI uses
 `try_recv`, so neither voice discovery nor synthesis can block rendering.
+
+Subtitle files are decoded as UTF-8, UTF-16, or legacy Chinese GBK. Each cue is
+synthesized separately. The pipeline streams zero-valued PCM through silent
+gaps and encodes the combined 24 kHz mono timeline with the bundled pure-Rust
+MP3 codec, so the app does not require `ffmpeg` or `lame`. If a spoken cue is
+longer than its time slot, the app first requests a faster version of that cue;
+only a still-overlong result is faded and clipped to protect later timestamps.
 
 The voice catalogue is cached as JSON under the user's macOS cache directory.
 If a later refresh fails, the app can still show the last successful list.
