@@ -37,7 +37,7 @@ Commercial use includes any use intended to obtain revenue, business benefit, co
 
 - Microsoft Edge Read Aloud 服务、端点、语音模型、音色、软件或商标；
 - 通过相关服务生成的音频是否可以商业使用；
-- Whisper 模型、第三方 crate、字体、编解码器或其他第三方材料；
+- Whisper、Qwen3-TTS 模型及其预设音色、第三方 crate、字体、编解码器或其他第三方材料；
 - 输入文本、人物声音、表演、音乐、商标、肖像或其他内容权利。
 
 A project commercial license can cover only original code that the project copyright holder is entitled to license. It cannot grant rights in Microsoft services or voices, generated audio, third-party models and libraries, input content, trademarks, publicity rights, or any other third-party material.
@@ -48,6 +48,8 @@ A project commercial license can cover only original code that the project copyr
 
 1. 从 Microsoft 及所有相关权利人取得适用于实际使用场景的明确商业许可；或
 2. 将内置 Edge Read Aloud 接口替换为具有有效商业合同和明确输出权利的正式 TTS 服务。
+
+如商业产品启用 Qwen3-TTS，本项目商业授权仍只覆盖项目原创代码。被授权方必须独立核对所下载模型版本的许可证并保留必要声明，同时自行处理预设音色、生成内容、商标、人格权及适用法律；Qwen3-TTS 模型采用宽松许可证，不代表本项目公开版本可以商业使用。
 
 被授权方还必须遵守所有第三方许可证、数据保护义务、消费者保护规则及适用法律。项目版权持有人不对第三方是否批准商业使用作出保证。
 

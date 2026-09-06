@@ -3,7 +3,7 @@ name = "edge-tts-studio"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "A cross-platform Edge TTS and local Whisper subtitle studio"
+description = "A cross-platform Edge/Qwen3 TTS and local Whisper subtitle studio"
 license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
@@ -14,6 +14,7 @@ encoding_rs = "0.8.35"
 futures-util = "0.3"
 proxy_cfg = "0.4.2"
 rfd = "0.17.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rodio = { version = "0.20.1", default-features = false }
 rusty_mp3 = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,11 +25,15 @@ url = "2.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 # Use Apple GPU acceleration for local Whisper transcription on macOS.
 rwhisper = { version = "0.4.1", features = ["metal"] }
+# Qwen3-TTS runs fully locally through Candle and uses Apple Metal on macOS.
+speakers-qwen3-tts = { version = "0.3.0", default-features = false, features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # Candle's portable CPU backend keeps the same local transcription feature on
 # Windows and Linux without trying to compile Apple's Metal framework.
 rwhisper = { version = "0.4.1" }
+# Keep the same local Qwen3-TTS feature on non-Apple platforms using CPU.
+speakers-qwen3-tts = { version = "0.3.0", default-features = false, features = ["cpu"] }
 
 [patch.crates-io]
 # Keep the upstream API, with a small bounds-safe DTW timestamp fix for long

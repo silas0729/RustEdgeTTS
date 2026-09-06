@@ -1,12 +1,21 @@
 # Edge TTS Studio
 
-A lightweight Rust desktop GUI for macOS and Windows. It fetches Microsoft Edge Read Aloud
-voices, accepts multiline text, and writes synthesized speech to an MP3 file.
+A lightweight Rust desktop GUI for macOS and Windows. It combines Microsoft Edge Read Aloud
+voices with an optional, fully local Qwen3-TTS engine, accepts multiline text, and writes
+synthesized speech to an MP3 file.
 The interface defaults to Chinese, can switch to English, supports bilingual
 voice search, one-click voice previews, speech-rate and volume controls,
 and keeps long documents inside a dedicated scrollable editor. It can also
 import SRT (including `.str`-named files), WebVTT, ASS/SSA, and LRC subtitles and build an MP3 whose silence
 and speech follow the authored cue timings.
+
+The Qwen3 local mode uses the official
+`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` checkpoint with nine preset voices.
+It supports Chinese, English, mixed Chinese/English text, Japanese, and Korean
+voice presets. The first Qwen generation or preview downloads about 2.4 GB in
+total (the approximately 1.8 GB voice model plus its 12Hz audio decoder and
+tokenizer) to the application cache; later synthesis is local and reuses that
+cache. No Python, PyTorch, ONNX runtime, or external audio encoder is used.
 
 The second workspace turns an MP3 back into SRT or WebVTT subtitles with a
 local, quantized Whisper Large-v3 Turbo model. Chinese/English mixed recognition
@@ -27,11 +36,13 @@ RustEdgeTTS/
 ├── README.md
 ├── examples/
 │   ├── edge_smoke.rs
+│   ├── qwen_smoke.rs
 │   ├── asr_smoke.rs
 │   └── subtitle_smoke.rs
 └── src/
     ├── asr.rs                  # local Whisper inference and SRT/VTT export
     ├── main.rs                 # egui UI and Tokio channel worker
+    ├── qwen_local.rs           # local Qwen3-TTS model and language detection
     ├── subtitle_pipeline.rs    # asynchronous per-cue TTS orchestration
     ├── subtitles.rs            # SRT/VTT/ASS/SSA/LRC and text encodings
     ├── system_proxy.rs
@@ -73,6 +84,7 @@ cargo test
 cargo run --example edge_smoke
 cargo run --example subtitle_smoke
 cargo run --release --example asr_smoke
+cargo run --release --example qwen_smoke
 ```
 
 The live smoke tests write their MP3 results into the macOS temporary directory
@@ -82,6 +94,12 @@ checks that its duration matches the eight-second test timeline.
 passed explicitly. Its first run downloads about 478 MB of model data from
 Hugging Face into the user's Application Support cache; later runs reuse those
 files and transcribe offline.
+
+Qwen3-TTS is substantially larger than the other dependencies, so the normal
+test suite validates engine selection, mixed-language detection, long-text
+segmentation, PCM speed/volume processing, and MP3 encoding without downloading
+the model. A real first-run synthesis is initiated from the app and requires
+enough free disk space and memory for the official checkpoint.
 
 ## Build the macOS app and installer image
 
@@ -107,15 +125,16 @@ cargo build --release --locked
 
 The portable program is written to
 `target\release\edge-tts-studio.exe`. Windows uses CPU inference for the local
-Whisper model; macOS continues to use Metal acceleration. A distributable
+Whisper and Qwen3-TTS models; macOS continues to use Metal acceleration. A distributable
 installer and SmartScreen reputation require separate Windows packaging and
 code signing.
 
 ## Architecture
 
-The main thread owns `eframe`/`egui`; all voice discovery, synthesis, cache I/O,
-and MP3 writing run in the background. A dedicated OS thread owns a two-thread
-Tokio runtime and a reusable `EdgeTtsClient`. Two `tokio::sync::mpsc` channels
+The main thread owns `eframe`/`egui`; all voice discovery, Edge/Qwen synthesis,
+model loading, cache I/O, and MP3 writing run in the background. A dedicated OS
+thread owns a two-thread Tokio runtime, a reusable `EdgeTtsClient`, and an
+on-demand Qwen model. Two `tokio::sync::mpsc` channels
 carry commands to that worker and results back to the UI. The UI uses
 `try_recv`, so neither voice discovery nor synthesis can block rendering.
 
@@ -139,11 +158,19 @@ English sentence boundaries into readable subtitle cues. The small public model
 configuration is embedded in the binary so a transient network failure after
 the large weight download cannot invalidate the first run.
 
+On macOS, Qwen3-TTS uses Candle's Metal backend. Windows and Linux use its CPU
+backend. The worker releases Qwen before loading Whisper (and vice versa), so
+the two large local models do not occupy memory at the same time. Qwen output is
+resampled in Rust for the selected speed and volume, then encoded as 24 kHz mono
+MP3. In subtitle mode every cue remains anchored to its authored start time.
+
 ## Privacy and service note
 
-This is an online TTS client. The entered text, chosen voice, and synthesis
+Edge mode is an online TTS client. The entered text, chosen voice, and synthesis
 settings are sent to Microsoft's Edge Read Aloud service. No API key is needed,
-but this is an unofficial service endpoint and availability can change.
+but this is an unofficial service endpoint and availability can change. Qwen3
+mode downloads model files once, then performs synthesis locally without sending
+the entered text to a TTS service.
 
 Audio-to-subtitle recognition is local after the one-time model download: MP3
 content and generated subtitles are not uploaded. Whisper may still make
@@ -151,6 +178,12 @@ recognition errors or hallucinate text, so important subtitles should be
 proofread before publication. Whisper Large-v3 Turbo and its model
 configuration are MIT-licensed; model files are downloaded from their
 Hugging Face repositories rather than redistributed inside this app.
+
+The official Qwen3-TTS checkpoint is Apache-2.0 licensed and downloaded from
+its Qwen Hugging Face repository rather than bundled in the installer. The
+`speakers-qwen3-tts` Rust inference backend is a community Candle implementation,
+not an official Qwen Rust SDK. See `SERVICE_AND_VOICE_NOTICE.md` for the separate
+model, voice, generated-content, and noncommercial-project boundaries.
 
 ## License and commercial use
 

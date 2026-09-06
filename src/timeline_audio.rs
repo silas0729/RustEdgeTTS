@@ -75,7 +75,7 @@ fn trim_edge_silence(pcm: &mut Vec<f32>) {
     pcm.drain(..start);
 }
 
-fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+pub fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
     if input.is_empty() || source_rate == target_rate {
         return input.to_vec();
     }
@@ -91,6 +91,52 @@ fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32
         output.push(input[left] * (1.0 - fraction) + input[right] * fraction);
     }
     output
+}
+
+/// Apply the same speed semantics as Edge TTS to locally generated PCM.
+/// Positive values shorten playback and negative values lengthen it.
+pub fn adjust_speed(input: &[f32], rate_percent: i32) -> Vec<f32> {
+    if input.is_empty() || rate_percent == 0 {
+        return input.to_vec();
+    }
+    let factor = (1.0 + rate_percent as f64 / 100.0).max(0.1);
+    let output_len = ((input.len() as f64 / factor).round() as usize).max(1);
+    resample_to_len(input, output_len)
+}
+
+pub fn resample_to_len(input: &[f32], output_len: usize) -> Vec<f32> {
+    if input.is_empty() || output_len == 0 {
+        return Vec::new();
+    }
+    if input.len() == output_len {
+        return input.to_vec();
+    }
+    if output_len == 1 {
+        return vec![input[0]];
+    }
+    let ratio = (input.len() - 1) as f64 / (output_len - 1) as f64;
+    let mut output = Vec::with_capacity(output_len);
+    for output_index in 0..output_len {
+        let source_position = output_index as f64 * ratio;
+        let left = source_position.floor() as usize;
+        let right = (left + 1).min(input.len() - 1);
+        let fraction = (source_position - left as f64) as f32;
+        output.push(input[left] * (1.0 - fraction) + input[right] * fraction);
+    }
+    output
+}
+
+pub fn apply_volume(samples: &mut [f32], volume_percent: i32) {
+    let gain = (1.0 + volume_percent as f32 / 100.0).max(0.0);
+    for sample in samples {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+}
+
+pub fn encode_mono_mp3(samples: &[f32]) -> Result<Vec<u8>, String> {
+    let mut encoder = TimelineMp3Encoder::new();
+    encoder.write_clip(samples)?;
+    encoder.finish()
 }
 
 pub fn milliseconds_to_samples(milliseconds: u64) -> u64 {
@@ -218,5 +264,17 @@ mod tests {
         fade_out_for_truncation(&mut samples);
         assert_eq!(samples[0], 1.0);
         assert!(samples.last().unwrap().abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn local_speed_and_volume_processing_is_bounded() {
+        let source = vec![0.75; 24_000];
+        let mut faster = adjust_speed(&source, 100);
+        assert_eq!(faster.len(), 12_000);
+        apply_volume(&mut faster, 100);
+        assert!(faster.iter().all(|sample| *sample <= 1.0));
+
+        let slower = adjust_speed(&source, -50);
+        assert_eq!(slower.len(), 48_000);
     }
 }
