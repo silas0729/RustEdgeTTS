@@ -1,20 +1,23 @@
 use std::{
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use directories::ProjectDirs;
 use edge_tts_rust::{EdgeTtsClient, SpeakOptions};
 use eframe::egui;
+use rwhisper::{ModelLoadingProgress, Whisper};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+mod asr;
 mod subtitle_pipeline;
 mod subtitles;
 mod system_proxy;
 mod timeline_audio;
 
+use asr::{RecognitionLanguage, SubtitleExportFormat};
 use subtitles::{SubtitleCue, SubtitleTrack, format_timestamp, parse_subtitle};
 
 const APP_NAME: &str = "Edge TTS Studio";
@@ -68,6 +71,12 @@ enum WorkerCommand {
         volume_percent: i32,
         output_path: PathBuf,
     },
+    TranscribeMp3 {
+        input_path: PathBuf,
+        output_path: PathBuf,
+        language: RecognitionLanguage,
+        format: SubtitleExportFormat,
+    },
 }
 
 /// Results travel back to egui. The UI polls this channel without blocking.
@@ -94,6 +103,22 @@ enum WorkerEvent {
         adjusted_count: usize,
         truncated_count: usize,
     },
+    AsrModelProgress {
+        source: String,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    AsrModelReady,
+    TranscriptionProgress {
+        progress: f32,
+        remaining_seconds: u64,
+    },
+    TranscriptionFinished {
+        output_path: PathBuf,
+        cues: Vec<SubtitleCue>,
+        audio_duration_ms: u64,
+    },
+    TranscriptionFailed(String),
     GenerationFailed(String),
     WorkerFailed(String),
 }
@@ -102,6 +127,12 @@ enum WorkerEvent {
 enum InputMode {
     Text,
     Subtitles,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMode {
+    TextToSpeech,
+    AudioToSubtitles,
 }
 
 enum GenerationContent {
@@ -385,6 +416,7 @@ struct TtsApp {
     selected_voice: Option<usize>,
     voice_filter: String,
     text: String,
+    workspace_mode: WorkspaceMode,
     input_mode: InputMode,
     subtitle_track: Option<SubtitleTrack>,
     subtitle_path: Option<PathBuf>,
@@ -395,6 +427,16 @@ struct TtsApp {
     fetching_voices: bool,
     previewing: bool,
     generating: bool,
+    last_generated_audio: Option<PathBuf>,
+    asr_input_path: Option<PathBuf>,
+    recognition_language: RecognitionLanguage,
+    subtitle_export_format: SubtitleExportFormat,
+    loading_asr_model: bool,
+    transcribing: bool,
+    transcription_progress: f32,
+    transcription_remaining_seconds: u64,
+    transcription_cues: Vec<SubtitleCue>,
+    transcription_output_path: Option<PathBuf>,
     status: Option<StatusMessage>,
 }
 
@@ -432,6 +474,7 @@ impl TtsApp {
             selected_voice: None,
             voice_filter: String::new(),
             text: DEFAULT_TEXT.to_owned(),
+            workspace_mode: WorkspaceMode::TextToSpeech,
             input_mode: InputMode::Text,
             subtitle_track: None,
             subtitle_path: None,
@@ -442,6 +485,16 @@ impl TtsApp {
             fetching_voices,
             previewing: false,
             generating: false,
+            last_generated_audio: None,
+            asr_input_path: None,
+            recognition_language: RecognitionLanguage::MixedChineseEnglish,
+            subtitle_export_format: SubtitleExportFormat::Srt,
+            loading_asr_model: false,
+            transcribing: false,
+            transcription_progress: 0.0,
+            transcription_remaining_seconds: 0,
+            transcription_cues: Vec::new(),
+            transcription_output_path: None,
             status,
         }
     }
@@ -531,6 +584,7 @@ impl TtsApp {
                 } => {
                     self.generating = false;
                     self.subtitle_progress = None;
+                    self.last_generated_audio = Some(output_path.clone());
                     self.status = Some(StatusMessage::new(
                         StatusKind::Success,
                         format!(
@@ -561,6 +615,7 @@ impl TtsApp {
                 } => {
                     self.generating = false;
                     self.subtitle_progress = None;
+                    self.last_generated_audio = Some(output_path.clone());
                     let kind = if truncated_count > 0 {
                         StatusKind::Warning
                     } else {
@@ -580,6 +635,102 @@ impl TtsApp {
                         ),
                     ));
                 }
+                WorkerEvent::AsrModelProgress {
+                    source,
+                    downloaded_bytes,
+                    total_bytes,
+                } => {
+                    self.loading_asr_model = true;
+                    let progress = if total_bytes > 0 {
+                        downloaded_bytes as f32 / total_bytes as f32
+                    } else {
+                        0.0
+                    };
+                    self.transcription_progress = progress.clamp(0.0, 1.0);
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        format!(
+                            "正在准备本地模型：{}（{:.1}/{:.1} MB）",
+                            compact_model_source(&source),
+                            downloaded_bytes as f64 / 1_048_576.0,
+                            total_bytes as f64 / 1_048_576.0
+                        ),
+                        format!(
+                            "Preparing local model: {} ({:.1}/{:.1} MB)",
+                            compact_model_source(&source),
+                            downloaded_bytes as f64 / 1_048_576.0,
+                            total_bytes as f64 / 1_048_576.0
+                        ),
+                    ));
+                }
+                WorkerEvent::AsrModelReady => {
+                    self.loading_asr_model = false;
+                    self.transcription_progress = 0.0;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        "模型文件已就绪，正在进行本地语音识别…",
+                        "Model files are ready. Running local speech recognition…",
+                    ));
+                }
+                WorkerEvent::TranscriptionProgress {
+                    progress,
+                    remaining_seconds,
+                } => {
+                    self.loading_asr_model = false;
+                    self.transcription_progress = progress.clamp(0.0, 1.0);
+                    self.transcription_remaining_seconds = remaining_seconds;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        format!(
+                            "正在本地识别… {:.0}% · 预计剩余 {}",
+                            self.transcription_progress * 100.0,
+                            format_duration_seconds(remaining_seconds)
+                        ),
+                        format!(
+                            "Transcribing locally… {:.0}% · about {} remaining",
+                            self.transcription_progress * 100.0,
+                            format_duration_seconds(remaining_seconds)
+                        ),
+                    ));
+                }
+                WorkerEvent::TranscriptionFinished {
+                    output_path,
+                    cues,
+                    audio_duration_ms,
+                } => {
+                    self.loading_asr_model = false;
+                    self.transcribing = false;
+                    self.transcription_progress = 1.0;
+                    self.transcription_remaining_seconds = 0;
+                    self.transcription_cues = cues;
+                    self.transcription_output_path = Some(output_path.clone());
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Success,
+                        format!(
+                            "已在本机生成 {} 条字幕（音频 {}）：{}",
+                            self.transcription_cues.len(),
+                            format_timestamp(audio_duration_ms),
+                            output_path.display()
+                        ),
+                        format!(
+                            "Generated {} subtitle cues locally from {} of audio: {}",
+                            self.transcription_cues.len(),
+                            format_timestamp(audio_duration_ms),
+                            output_path.display()
+                        ),
+                    ));
+                }
+                WorkerEvent::TranscriptionFailed(error) => {
+                    self.loading_asr_model = false;
+                    self.transcribing = false;
+                    self.transcription_progress = 0.0;
+                    self.transcription_remaining_seconds = 0;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Error,
+                        format!("生成字幕失败：{}", localized_transcription_error(&error)),
+                        format!("Subtitle generation failed: {error}"),
+                    ));
+                }
                 WorkerEvent::GenerationFailed(error) => {
                     self.generating = false;
                     self.subtitle_progress = None;
@@ -593,6 +744,8 @@ impl TtsApp {
                     self.fetching_voices = false;
                     self.previewing = false;
                     self.generating = false;
+                    self.loading_asr_model = false;
+                    self.transcribing = false;
                     self.subtitle_progress = None;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Error,
@@ -605,7 +758,7 @@ impl TtsApp {
     }
 
     fn reload_voices(&mut self) {
-        if self.fetching_voices || self.previewing || self.generating {
+        if self.fetching_voices || self.previewing || self.generating || self.transcribing {
             return;
         }
 
@@ -629,7 +782,7 @@ impl TtsApp {
     }
 
     fn start_generation(&mut self) {
-        if self.generating || self.previewing || self.fetching_voices {
+        if self.generating || self.previewing || self.fetching_voices || self.transcribing {
             return;
         }
 
@@ -744,7 +897,7 @@ impl TtsApp {
     }
 
     fn import_subtitle(&mut self) {
-        if self.generating || self.previewing {
+        if self.generating || self.previewing || self.transcribing {
             return;
         }
         let Some(path) = rfd::FileDialog::new()
@@ -802,7 +955,7 @@ impl TtsApp {
     }
 
     fn start_preview(&mut self) {
-        if self.fetching_voices || self.previewing || self.generating {
+        if self.fetching_voices || self.previewing || self.generating || self.transcribing {
             return;
         }
 
@@ -853,6 +1006,121 @@ impl TtsApp {
         }
     }
 
+    fn choose_audio_for_transcription(&mut self) {
+        if self.transcribing {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(
+                self.ui_language
+                    .text("选择需要生成字幕的 MP3", "Choose an MP3 to transcribe"),
+            )
+            .add_filter(self.ui_language.text("MP3 音频", "MP3 audio"), &["mp3"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.asr_input_path = Some(path);
+        self.transcription_cues.clear();
+        self.transcription_output_path = None;
+        self.status = Some(StatusMessage::new(
+            StatusKind::Info,
+            "音频已选择。模型首次使用会下载到本机，之后可以离线识别。",
+            "Audio selected. The model is downloaded once, then transcription works offline.",
+        ));
+    }
+
+    fn use_last_generated_audio(&mut self) {
+        let Some(path) = self
+            .last_generated_audio
+            .as_ref()
+            .filter(|path| path.is_file())
+            .cloned()
+        else {
+            self.status = Some(StatusMessage::new(
+                StatusKind::Warning,
+                "还没有可用的已生成 MP3，请先生成语音或手动选择文件。",
+                "There is no generated MP3 yet. Generate speech or choose a file first.",
+            ));
+            return;
+        };
+        self.asr_input_path = Some(path);
+        self.transcription_cues.clear();
+        self.transcription_output_path = None;
+    }
+
+    fn start_transcription(&mut self) {
+        if self.transcribing || self.generating || self.previewing {
+            return;
+        }
+        let Some(input_path) = self.asr_input_path.clone() else {
+            self.status = Some(StatusMessage::new(
+                StatusKind::Error,
+                "请先选择需要识别的 MP3 音频。",
+                "Choose an MP3 audio file before transcribing.",
+            ));
+            return;
+        };
+        if !input_path.is_file() {
+            self.status = Some(StatusMessage::new(
+                StatusKind::Error,
+                "所选音频已不存在，请重新选择。",
+                "The selected audio no longer exists. Choose it again.",
+            ));
+            return;
+        }
+
+        let stem = input_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("transcript");
+        let default_name = format!("{stem}.{}", self.subtitle_export_format.extension());
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_title(
+                self.ui_language
+                    .text("保存本地识别字幕", "Save local transcription"),
+            )
+            .set_file_name(default_name)
+            .set_can_create_directories(true)
+            .add_filter(
+                self.subtitle_export_format.label(),
+                &[self.subtitle_export_format.extension()],
+            )
+            .save_file()
+            .map(|path| ensure_subtitle_extension(path, self.subtitle_export_format))
+        else {
+            return;
+        };
+
+        let command = WorkerCommand::TranscribeMp3 {
+            input_path,
+            output_path,
+            language: self.recognition_language,
+            format: self.subtitle_export_format,
+        };
+        match self.command_tx.send(command) {
+            Ok(()) => {
+                self.transcribing = true;
+                self.loading_asr_model = true;
+                self.transcription_progress = 0.0;
+                self.transcription_remaining_seconds = 0;
+                self.transcription_cues.clear();
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Info,
+                    "正在检查并加载本地 Whisper 模型…",
+                    "Checking and loading the local Whisper model…",
+                ));
+            }
+            Err(_) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "后台服务已停止，请重新启动应用。",
+                    "The background worker has stopped. Restart the app.",
+                ));
+            }
+        }
+    }
+
     fn selected_voice_label(&self) -> String {
         self.selected_voice
             .and_then(|index| self.voices.get(index))
@@ -878,7 +1146,7 @@ impl eframe::App for TtsApp {
 
         // Poll only while work is active. This keeps the idle app at near-zero
         // repaint CPU while still noticing worker results promptly.
-        if self.fetching_voices || self.previewing || self.generating {
+        if self.fetching_voices || self.previewing || self.generating || self.transcribing {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
@@ -894,31 +1162,47 @@ impl eframe::App for TtsApp {
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         self.show_header(ui);
-                        ui.add_space(18.0);
+                        ui.add_space(14.0);
+                        self.show_workspace_switcher(ui, language);
+                        ui.add_space(14.0);
 
-                        let footer_height = 88.0;
-                        let workspace_height = (ui.available_height() - footer_height).max(360.0);
+                        // Reserve the complete action/status/privacy area before
+                        // sizing the cards. The previous fixed 88 px estimate
+                        // was too small once a success message wrapped, pushing
+                        // the action row below the macOS window edge.
+                        let footer_height = match self.workspace_mode {
+                            WorkspaceMode::TextToSpeech => 98.0,
+                            WorkspaceMode::AudioToSubtitles => 118.0,
+                        };
+                        let workspace_height = (ui.available_height() - footer_height).max(320.0);
                         let gap = 14.0;
                         let total_width = ui.available_width();
-                        let voice_width = (total_width * 0.39).clamp(360.0, 420.0);
-                        let text_width = (total_width - voice_width - gap).max(420.0);
-
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = gap;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(voice_width, workspace_height),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.show_voice_card(ui, language, workspace_height),
-                            );
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(text_width, workspace_height),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.show_text_card(ui, language, workspace_height),
-                            );
-                        });
-
-                        ui.add_space(14.0);
-                        self.show_generate_area(ui, language);
+                        match self.workspace_mode {
+                            WorkspaceMode::TextToSpeech => {
+                                let voice_width = (total_width * 0.39).clamp(360.0, 420.0);
+                                let text_width = (total_width - voice_width - gap).max(420.0);
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = gap;
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(voice_width, workspace_height),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| self.show_voice_card(ui, language, workspace_height),
+                                    );
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(text_width, workspace_height),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| self.show_text_card(ui, language, workspace_height),
+                                    );
+                                });
+                                ui.add_space(14.0);
+                                self.show_generate_area(ui, language);
+                            }
+                            WorkspaceMode::AudioToSubtitles => {
+                                self.show_asr_workspace(ui, language, workspace_height, gap);
+                                ui.add_space(14.0);
+                                self.show_transcription_area(ui, language);
+                            }
+                        }
                     });
             });
     }
@@ -958,10 +1242,16 @@ impl TtsApp {
                 );
                 ui.add_space(2.0);
                 ui.label(
-                    egui::RichText::new(self.ui_language.text(
-                        "把文字快速转换为自然流畅的 MP3 语音",
-                        "Turn text into natural-sounding MP3 speech",
-                    ))
+                    egui::RichText::new(match self.workspace_mode {
+                        WorkspaceMode::TextToSpeech => self.ui_language.text(
+                            "把文字快速转换为自然流畅的 MP3 语音",
+                            "Turn text into natural-sounding MP3 speech",
+                        ),
+                        WorkspaceMode::AudioToSubtitles => self.ui_language.text(
+                            "使用本地 Whisper 模型把 MP3 转换为精准字幕",
+                            "Create accurate subtitles with a local Whisper model",
+                        ),
+                    })
                     .size(14.0)
                     .color(TEXT_SECONDARY),
                 );
@@ -980,10 +1270,49 @@ impl TtsApp {
         });
     }
 
+    fn show_workspace_switcher(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        egui::Frame::new()
+            .fill(PRIMARY_SOFT)
+            .corner_radius(11)
+            .inner_margin(egui::Margin::same(4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let tts = mode_button(
+                        ui,
+                        language.text("文字 / 字幕转语音", "Text / subtitles to speech"),
+                        self.workspace_mode == WorkspaceMode::TextToSpeech,
+                        178.0,
+                    );
+                    let asr = mode_button(
+                        ui,
+                        language.text("音频转字幕", "Audio to subtitles"),
+                        self.workspace_mode == WorkspaceMode::AudioToSubtitles,
+                        150.0,
+                    );
+                    if tts.clicked() {
+                        self.workspace_mode = WorkspaceMode::TextToSpeech;
+                    }
+                    if asr.clicked() {
+                        self.workspace_mode = WorkspaceMode::AudioToSubtitles;
+                        if self.asr_input_path.is_none()
+                            && let Some(path) = self
+                                .last_generated_audio
+                                .as_ref()
+                                .filter(|path| path.is_file())
+                                .cloned()
+                        {
+                            self.asr_input_path = Some(path);
+                        }
+                    }
+                });
+            });
+    }
+
     fn show_voice_card(&mut self, ui: &mut egui::Ui, language: UiLanguage, card_height: f32) {
         card_frame().show(ui, |ui| {
             ui.set_min_height((card_height - 36.0).max(0.0));
-            let busy = self.fetching_voices || self.previewing || self.generating;
+            let busy =
+                self.fetching_voices || self.previewing || self.generating || self.transcribing;
 
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -1569,6 +1898,429 @@ impl TtsApp {
             });
     }
 
+    fn show_asr_workspace(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: UiLanguage,
+        workspace_height: f32,
+        gap: f32,
+    ) {
+        let total_width = ui.available_width();
+        let settings_width = (total_width * 0.38).clamp(350.0, 410.0);
+        let preview_width = (total_width - settings_width - gap).max(430.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            ui.allocate_ui_with_layout(
+                egui::vec2(settings_width, workspace_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| self.show_asr_settings_card(ui, language, workspace_height),
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(preview_width, workspace_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| self.show_asr_result_card(ui, language, workspace_height),
+            );
+        });
+    }
+
+    fn show_asr_settings_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: UiLanguage,
+        card_height: f32,
+    ) {
+        card_frame().show(ui, |ui| {
+            ui.set_min_height((card_height - 36.0).max(0.0));
+            ui.label(
+                egui::RichText::new(language.text("音频与识别设置", "Audio & recognition"))
+                    .size(17.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.label(
+                egui::RichText::new(language.text(
+                    "音频只在本机处理，不会上传",
+                    "Audio stays on this Mac and is never uploaded",
+                ))
+                .size(13.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.add_space(16.0);
+
+            let selected_name = self
+                .asr_input_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            egui::Frame::new()
+                .fill(EDITOR_BACKGROUND)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(11)
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("♫").size(24.0).color(PRIMARY));
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(selected_name.as_deref().unwrap_or_else(|| {
+                                    language.text("尚未选择 MP3", "No MP3 selected")
+                                }))
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(language.text(
+                                    "支持应用生成的 MP3 音频",
+                                    "Supports MP3 audio generated by the app",
+                                ))
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                            );
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let choose = secondary_action_button(
+                            language.text("选择 MP3", "Choose MP3"),
+                            108.0,
+                        );
+                        if ui.add_enabled(!self.transcribing, choose).clicked() {
+                            self.choose_audio_for_transcription();
+                        }
+                        let use_latest = secondary_action_button(
+                            language.text("使用刚生成的音频", "Use latest audio"),
+                            146.0,
+                        );
+                        let latest_available = self
+                            .last_generated_audio
+                            .as_ref()
+                            .is_some_and(|path| path.is_file());
+                        if ui
+                            .add_enabled(!self.transcribing && latest_available, use_latest)
+                            .clicked()
+                        {
+                            self.use_last_generated_audio();
+                        }
+                    });
+                });
+
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new(language.text("识别语言", "Recognition language"))
+                    .size(13.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.label(
+                egui::RichText::new(language.text(
+                    "逐句中英文交替请选择“中英混合”",
+                    "Use CN + EN when the spoken language alternates",
+                ))
+                .size(11.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.add_space(7.0);
+            egui::Frame::new()
+                .fill(PRIMARY_SOFT)
+                .corner_radius(9)
+                .inner_margin(egui::Margin::same(3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (value, chinese, english, width) in [
+                            (RecognitionLanguage::Chinese, "纯中文", "Chinese", 84.0),
+                            (
+                                RecognitionLanguage::MixedChineseEnglish,
+                                "中英混合（推荐）",
+                                "CN + EN",
+                                132.0,
+                            ),
+                            (RecognitionLanguage::English, "纯英文", "English", 84.0),
+                        ] {
+                            let response = mode_button(
+                                ui,
+                                language.text(chinese, english),
+                                self.recognition_language == value,
+                                width,
+                            );
+                            if response.clicked() && !self.transcribing {
+                                self.recognition_language = value;
+                            }
+                        }
+                    });
+                });
+
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new(language.text("字幕格式", "Subtitle format"))
+                    .size(13.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.add_space(7.0);
+            ui.horizontal(|ui| {
+                for format in [SubtitleExportFormat::Srt, SubtitleExportFormat::WebVtt] {
+                    let response = mode_button(
+                        ui,
+                        format.label(),
+                        self.subtitle_export_format == format,
+                        106.0,
+                    );
+                    if response.clicked() && !self.transcribing {
+                        self.subtitle_export_format = format;
+                    }
+                }
+            });
+
+            ui.add_space(18.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(242, 247, 255))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(215, 226, 247),
+                ))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::same(11))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Whisper Large-v3 Turbo · Q8")
+                            .size(12.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        egui::RichText::new(language.text(
+                            "纯 Rust + Candle · Metal 加速 · 首次约需下载 478 MB",
+                            "Pure Rust + Candle · Metal · about 478 MB on first use",
+                        ))
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new(language.text(
+                            "首次准备模型需要联网；模型缓存后，识别过程完全离线。",
+                            "Internet is needed once; transcription is fully offline after caching.",
+                        ))
+                        .size(11.0)
+                        .color(PRIMARY),
+                    );
+                });
+        });
+    }
+
+    fn show_asr_result_card(&mut self, ui: &mut egui::Ui, language: UiLanguage, card_height: f32) {
+        card_frame().show(ui, |ui| {
+            ui.set_min_height((card_height - 36.0).max(0.0));
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(language.text("字幕预览", "Subtitle preview"))
+                            .size(17.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        egui::RichText::new(language.text(
+                            "按语音时间戳自动分句，可直接用于剪辑软件",
+                            "Timestamped and split into editor-friendly cues",
+                        ))
+                        .size(13.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+                if !self.transcription_cues.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(if language == UiLanguage::Chinese {
+                                format!("{} 条", self.transcription_cues.len())
+                            } else {
+                                format!("{} cues", self.transcription_cues.len())
+                            })
+                            .size(12.0)
+                            .color(PRIMARY),
+                        );
+                    });
+                }
+            });
+            ui.add_space(14.0);
+
+            // Stay inside the height allocated by the parent card. Forcing a
+            // 250 px minimum here could overflow the card on smaller windows
+            // and cover the action bar below it.
+            let content_height = ui.available_height().max(120.0);
+            egui::Frame::new()
+                .fill(EDITOR_BACKGROUND)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_min_height((content_height - 16.0).max(0.0));
+                    if self.transcribing && self.transcription_cues.is_empty() {
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::Center)
+                                .with_main_align(egui::Align::Center),
+                            |ui| {
+                                ui.spinner();
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(if self.loading_asr_model {
+                                        language.text("正在准备本地模型…", "Preparing local model…")
+                                    } else {
+                                        language.text("正在识别语音…", "Transcribing audio…")
+                                    })
+                                    .size(14.0)
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                                );
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::ProgressBar::new(self.transcription_progress)
+                                        .desired_width(280.0)
+                                        .show_percentage(),
+                                );
+                            },
+                        );
+                    } else if self.transcription_cues.is_empty() {
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::Center)
+                                .with_main_align(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new("CC").size(30.0).strong().color(PRIMARY),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(language.text(
+                                        "选择 MP3 后开始本地识别",
+                                        "Choose an MP3 to start local transcription",
+                                    ))
+                                    .size(14.0)
+                                    .color(TEXT_SECONDARY),
+                                );
+                            },
+                        );
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("asr-result-scroll")
+                            .max_height(content_height)
+                            .min_scrolled_height(content_height)
+                            .auto_shrink([false, false])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                            )
+                            .show(ui, |ui| {
+                                for (index, cue) in self.transcription_cues.iter().enumerate() {
+                                    ui.horizontal_top(|ui| {
+                                        ui.add_sized(
+                                            [30.0, 22.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{}", index + 1))
+                                                    .size(11.0)
+                                                    .color(TEXT_SECONDARY),
+                                            ),
+                                        );
+                                        ui.add_sized(
+                                            [142.0, 22.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "{} – {}",
+                                                    format_timestamp(cue.start_ms),
+                                                    format_timestamp(cue.end_ms)
+                                                ))
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(PRIMARY),
+                                            ),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&cue.text)
+                                                    .size(13.0)
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                    if index + 1 < self.transcription_cues.len() {
+                                        ui.separator();
+                                    }
+                                }
+                            });
+                    }
+                });
+        });
+    }
+
+    fn show_transcription_area(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        let can_transcribe = !self.transcribing
+            && !self.generating
+            && !self.previewing
+            && self
+                .asr_input_path
+                .as_ref()
+                .is_some_and(|path| path.is_file());
+        ui.horizontal(|ui| {
+            let label = if self.transcribing {
+                language.text("正在生成字幕…", "Generating subtitles…")
+            } else {
+                language.text("生成字幕文件", "Generate subtitle file")
+            };
+            let button = egui::Button::new(
+                egui::RichText::new(label)
+                    .size(15.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(PRIMARY)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(10)
+            .min_size(egui::vec2(160.0, 44.0));
+            if ui.add_enabled(can_transcribe, button).clicked() {
+                self.start_transcription();
+            }
+
+            if self.transcribing {
+                ui.spinner();
+            }
+            self.show_inline_status(ui, language);
+        });
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(language.text(
+                "隐私说明：识别时不调用云端 API，音频和字幕均保留在本机。",
+                "Privacy: no cloud API is used; audio and subtitles stay on this Mac.",
+            ))
+            .size(11.0)
+            .color(TEXT_SECONDARY),
+        );
+    }
+
+    fn show_inline_status(&self, ui: &mut egui::Ui, language: UiLanguage) {
+        if let Some(status) = &self.status {
+            let (fill, stroke, text_color) = status_colors(status.kind);
+            let full_status = status.text(language).to_owned();
+            let response = egui::Frame::new()
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, stroke))
+                .corner_radius(9)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&full_status)
+                                .size(12.0)
+                                .color(text_color),
+                        )
+                        .truncate(),
+                    )
+                })
+                .inner;
+            response.on_hover_text(full_status);
+        }
+    }
+
     fn show_generate_area(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
         let has_content = match self.input_mode {
             InputMode::Text => !self.text.trim().is_empty(),
@@ -1579,6 +2331,7 @@ impl TtsApp {
         };
         let can_generate = !self.generating
             && !self.previewing
+            && !self.transcribing
             && !self.fetching_voices
             && self.selected_voice.is_some()
             && has_content;
@@ -1675,6 +2428,22 @@ fn input_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, BORDER))
         .corner_radius(9)
         .inner_margin(egui::Margin::symmetric(11, 6))
+}
+
+fn secondary_action_button(label: &str, width: f32) -> egui::Button<'_> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(12.0)
+            .strong()
+            .color(PRIMARY),
+    )
+    .fill(CARD_BACKGROUND)
+    .stroke(egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgb(207, 216, 248),
+    ))
+    .corner_radius(8)
+    .min_size(egui::vec2(width, 34.0))
 }
 
 fn configure_voice_combo_style(ui: &mut egui::Ui) {
@@ -1774,6 +2543,26 @@ fn preview_text(text: &str, language: UiLanguage) -> String {
 
 fn signed_percent(value: i32) -> String {
     format!("{value:+}%")
+}
+
+fn compact_model_source(source: &str) -> &str {
+    if source.starts_with("Model") {
+        "Whisper Large-v3 Turbo"
+    } else if source.starts_with("Tokenizer") {
+        "Tokenizer"
+    } else if source.starts_with("Config") {
+        "Config"
+    } else {
+        source
+    }
+}
+
+fn format_duration_seconds(seconds: u64) -> String {
+    if seconds >= 60 {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn adjustment_row(
@@ -1936,6 +2725,7 @@ fn spawn_tts_worker() -> (
                 };
 
                 let cache_path = voice_cache_path();
+                let mut whisper_model: Option<(RecognitionLanguage, Whisper)> = None;
 
                 while let Some(command) = command_rx.recv().await {
                     match command {
@@ -1991,6 +2781,22 @@ fn spawn_tts_worker() -> (
                                 rate_percent,
                                 volume_percent,
                                 output_path,
+                            )
+                            .await;
+                        }
+                        WorkerCommand::TranscribeMp3 {
+                            input_path,
+                            output_path,
+                            language,
+                            format,
+                        } => {
+                            transcribe_mp3_locally(
+                                &thread_event_tx,
+                                &mut whisper_model,
+                                input_path,
+                                output_path,
+                                language,
+                                format,
                             )
                             .await;
                         }
@@ -2228,6 +3034,111 @@ async fn generate_subtitle_mp3(
     }
 }
 
+async fn transcribe_mp3_locally(
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    model_cache: &mut Option<(RecognitionLanguage, Whisper)>,
+    input_path: PathBuf,
+    output_path: PathBuf,
+    language: RecognitionLanguage,
+    format: SubtitleExportFormat,
+) {
+    let needs_model = model_cache
+        .as_ref()
+        .is_none_or(|(loaded_language, _)| *loaded_language != language);
+    if needs_model {
+        // Loading and inference stay on this Tokio worker. egui only receives
+        // progress events and therefore remains responsive even on first use.
+        let progress_tx = event_tx.clone();
+        let mut last_progress_event = Instant::now() - Duration::from_secs(1);
+        let mut previous_source = String::new();
+        let model = match asr::load_model(language, move |progress| match progress {
+            ModelLoadingProgress::Downloading { source, progress } => {
+                let source_changed = source != previous_source;
+                let finished = progress.progress >= progress.size;
+                if source_changed
+                    || finished
+                    || last_progress_event.elapsed() >= Duration::from_millis(150)
+                {
+                    previous_source.clone_from(&source);
+                    last_progress_event = Instant::now();
+                    let _ = progress_tx.send(WorkerEvent::AsrModelProgress {
+                        source,
+                        downloaded_bytes: progress.progress,
+                        total_bytes: progress.size,
+                    });
+                }
+            }
+            ModelLoadingProgress::Loading { progress } => {
+                if last_progress_event.elapsed() >= Duration::from_millis(150) || progress >= 1.0 {
+                    last_progress_event = Instant::now();
+                    let scaled = (progress.clamp(0.0, 1.0) * 100.0) as u64;
+                    let _ = progress_tx.send(WorkerEvent::AsrModelProgress {
+                        source: "Whisper model".to_owned(),
+                        downloaded_bytes: scaled,
+                        total_bytes: 100,
+                    });
+                }
+            }
+        })
+        .await
+        {
+            Ok(model) => model,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::TranscriptionFailed(error));
+                return;
+            }
+        };
+        *model_cache = Some((language, model));
+    }
+
+    let _ = event_tx.send(WorkerEvent::AsrModelReady);
+    let progress_tx = event_tx.clone();
+    let Some((_, model)) = model_cache.as_ref() else {
+        let _ = event_tx.send(WorkerEvent::TranscriptionFailed(
+            "The local model was not available after loading.".to_owned(),
+        ));
+        return;
+    };
+    let report = match asr::transcribe_mp3(model, &input_path, move |progress, remaining| {
+        let _ = progress_tx.send(WorkerEvent::TranscriptionProgress {
+            progress,
+            remaining_seconds: remaining,
+        });
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::TranscriptionFailed(error));
+            return;
+        }
+    };
+
+    let subtitle_text = asr::render_subtitles(&report.cues, format);
+    if let Some(parent) = output_path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        let _ = event_tx.send(WorkerEvent::TranscriptionFailed(format!(
+            "The subtitles were recognized, but the output folder could not be created: {error}"
+        )));
+        return;
+    }
+    match tokio::fs::write(&output_path, subtitle_text.as_bytes()).await {
+        Ok(()) => {
+            let _ = event_tx.send(WorkerEvent::TranscriptionFinished {
+                output_path,
+                cues: report.cues,
+                audio_duration_ms: report.audio_duration_ms,
+            });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::TranscriptionFailed(format!(
+                "The subtitles were recognized, but the file could not be saved: {error}"
+            )));
+        }
+    }
+}
+
 async fn save_voice_cache(path: &Path, voices: &[VoiceChoice]) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(voices).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
@@ -2262,6 +3173,35 @@ fn ensure_mp3_extension(mut path: PathBuf) -> PathBuf {
         path.set_extension("mp3");
     }
     path
+}
+
+fn ensure_subtitle_extension(mut path: PathBuf, format: SubtitleExportFormat) -> PathBuf {
+    let expected = format.extension();
+    let matches = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected));
+    if !matches {
+        path.set_extension(expected);
+    }
+    path
+}
+
+fn localized_transcription_error(error: &str) -> String {
+    if error.contains("No speech was recognized") {
+        "没有识别到清晰语音。中英文交替的音频请选择“中英混合”，并确认音量足够且人声清楚。"
+            .to_owned()
+    } else if error.contains("does not contain decodable audio")
+        || error.contains("Could not decode the MP3 file")
+    {
+        format!("无法解码这个 MP3，请确认文件完整且不是受保护音频。详细信息：{error}")
+    } else if error.contains("Could not load the local Whisper model") {
+        format!("无法加载本地 Whisper 模型，请检查首次下载是否完成。详细信息：{error}")
+    } else if error.contains("Could not read the MP3 file") {
+        format!("无法读取所选 MP3，请检查文件权限。详细信息：{error}")
+    } else {
+        error.to_owned()
+    }
 }
 
 fn configure_egui_for_macos(ctx: &egui::Context) {
@@ -2328,7 +3268,7 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([900.0, 620.0]),
+            .with_min_inner_size([960.0, 720.0]),
         ..Default::default()
     };
 

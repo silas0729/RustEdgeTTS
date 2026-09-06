@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = client
         .synthesize(
-            "你好，这是 Edge TTS Studio 的连通性测试。",
+            "你好，这是中英混合识别测试。Today we will learn how to order food in English. 谢谢。",
             SpeakOptions {
                 voice: voice.short_name.clone(),
                 rate: "+15%".to_owned(),
