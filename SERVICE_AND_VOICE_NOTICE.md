@@ -36,8 +36,9 @@ Microsoft、Microsoft Edge、Edge Read Aloud 以及相关名称和音色属于�
 
 ## Qwen3-TTS 本地语音功能
 
-本项目可按用户选择下载并在本机运行
-`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 模型。模型由 Qwen 团队发布，模型页面标注为 Apache License 2.0；模型文件不包含在本项目安装包中。`speakers-qwen3-tts` 是基于 Candle 的社区 Rust 推理实现，并非 Qwen 官方 Rust SDK。
+本项目可由用户单独选择下载并在本机运行
+`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 或
+`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`。两个模型由 Qwen 团队发布，模型页面均标注为 Apache License 2.0；模型文件不包含在本项目安装包中。应用只加载用户当前选择的版本，0.6B 首次约需下载 2.4 GB，1.7B 首次约需下载 4.5 GB。`speakers-qwen3-tts` 是基于 Candle 的社区 Rust 推理实现，并非 Qwen 官方 Rust SDK。
 
 Qwen3-TTS 模型、模型名称、预设音色、推理组件和生成内容分别受其适用许可证、模型条款及法律约束。本项目的 PolyForm Noncommercial 许可证仍然只允许将本项目作者代码用于个人学习和非商业研究；第三方组件采用更宽松许可证，并不会自动扩大本项目许可证授予的用途。
 
@@ -47,4 +48,5 @@ Qwen3-TTS 模型、模型名称、预设音色、推理组件和生成内容分�
 
 - Qwen3-TTS 官方项目：<https://github.com/QwenLM/Qwen3-TTS>
 - Qwen3-TTS 0.6B CustomVoice 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice>
+- Qwen3-TTS 1.7B CustomVoice 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice>
 - Apache License 2.0：<https://www.apache.org/licenses/LICENSE-2.0>

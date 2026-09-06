@@ -6,11 +6,64 @@ use std::{
 use directories::{BaseDirs, ProjectDirs};
 use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions};
 
-pub const MODEL_ID: &str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice";
-pub const MODEL_DOWNLOAD_LABEL: &str = "约 2.4 GB";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QwenModelVersion {
+    Small0_6B,
+    Large1_7B,
+}
 
-const MODEL_CACHE_FOLDER: &str = "qwen3-tts-12hz-0.6b-customvoice";
-const HF_MODEL_REPO_FOLDER: &str = "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots";
+impl QwenModelVersion {
+    pub const DEFAULT: Self = Self::Small0_6B;
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "0.6B",
+            Self::Large1_7B => "1.7B",
+        }
+    }
+
+    pub fn model_id(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            Self::Large1_7B => "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        }
+    }
+
+    pub fn download_size_label(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "2.4 GB",
+            Self::Large1_7B => "4.5 GB",
+        }
+    }
+
+    fn cache_folder(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "qwen3-tts-12hz-0.6b-customvoice",
+            Self::Large1_7B => "qwen3-tts-12hz-1.7b-customvoice",
+        }
+    }
+
+    fn hugging_face_repo_folder(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots",
+            Self::Large1_7B => "models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots",
+        }
+    }
+
+    fn minimum_main_model_size(self) -> u64 {
+        match self {
+            Self::Small0_6B => 1_500_000_000,
+            Self::Large1_7B => 3_500_000_000,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Small0_6B => Self::Large1_7B,
+            Self::Large1_7B => Self::Small0_6B,
+        }
+    }
+}
 
 pub struct DownloadProgress {
     pub file: &'static str,
@@ -120,15 +173,19 @@ impl QwenVoice {
 
 pub struct LocalQwenModel {
     model: Qwen3TTS,
+    version: QwenModelVersion,
     device_label: String,
 }
 
 impl LocalQwenModel {
-    /// Downloads missing official weights into Hugging Face's user cache, then
+    /// Downloads missing official weights into the application cache, then
     /// loads them with Candle. Calling this on the dedicated worker thread keeps
     /// both the synchronous download and model initialization away from egui.
-    pub fn load(mut on_progress: impl FnMut(DownloadProgress)) -> Result<Self, String> {
-        let model_dir = prepare_model_files(&mut on_progress)?;
+    pub fn load(
+        version: QwenModelVersion,
+        mut on_progress: impl FnMut(DownloadProgress),
+    ) -> Result<Self, String> {
+        let model_dir = prepare_model_files(version, &mut on_progress)?;
         let device = qwen3_tts::auto_device()
             .map_err(|error| format!("无法初始化 Qwen3-TTS 推理设备：{error:#}"))?;
         let device_label = if device.is_metal() {
@@ -145,8 +202,13 @@ impl LocalQwenModel {
             .map_err(|error| format!("无法加载 Qwen3-TTS 模型：{error:#}"))?;
         Ok(Self {
             model,
+            version,
             device_label,
         })
+    }
+
+    pub fn version(&self) -> QwenModelVersion {
+        self.version
     }
 
     pub fn device_label(&self) -> &str {
@@ -175,48 +237,19 @@ struct ModelFile {
     minimum_size: u64,
 }
 
-const MODEL_FILES: [ModelFile; 4] = [
-    ModelFile {
-        label: "main-model",
-        repository: MODEL_ID,
-        remote_path: "model.safetensors",
-        local_path: "model.safetensors",
-        minimum_size: 100_000_000,
-    },
-    ModelFile {
-        label: "model-config",
-        repository: MODEL_ID,
-        remote_path: "config.json",
-        local_path: "config.json",
-        minimum_size: 100,
-    },
-    ModelFile {
-        label: "audio-decoder",
-        repository: "Qwen/Qwen3-TTS-Tokenizer-12Hz",
-        remote_path: "model.safetensors",
-        local_path: "speech_tokenizer/model.safetensors",
-        minimum_size: 100_000_000,
-    },
-    ModelFile {
-        label: "text-tokenizer",
-        repository: "Qwen/Qwen2-0.5B",
-        remote_path: "tokenizer.json",
-        local_path: "tokenizer.json",
-        minimum_size: 100_000,
-    },
-];
-
-fn prepare_model_files(on_progress: &mut impl FnMut(DownloadProgress)) -> Result<PathBuf, String> {
+fn prepare_model_files(
+    version: QwenModelVersion,
+    on_progress: &mut impl FnMut(DownloadProgress),
+) -> Result<PathBuf, String> {
     let project_dirs = ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
         .ok_or_else(|| "无法确定 Qwen3-TTS 模型缓存目录。".to_owned())?;
-    let model_dir = project_dirs
-        .cache_dir()
-        .join("models")
-        .join(MODEL_CACHE_FOLDER);
+    let models_dir = project_dirs.cache_dir().join("models");
+    let model_dir = models_dir.join(version.cache_folder());
     std::fs::create_dir_all(&model_dir)
         .map_err(|error| format!("无法创建 Qwen3-TTS 模型缓存目录：{error}"))?;
 
-    reuse_hugging_face_main_model(&model_dir);
+    reuse_hugging_face_main_model(&model_dir, version);
+    reuse_shared_assets(&models_dir, &model_dir, version);
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(30 * 60))
@@ -224,16 +257,47 @@ fn prepare_model_files(on_progress: &mut impl FnMut(DownloadProgress)) -> Result
         .build()
         .map_err(|error| format!("无法初始化 Qwen3-TTS 下载器：{error}"))?;
 
-    for file in &MODEL_FILES {
+    let model_files = [
+        ModelFile {
+            label: "main-model",
+            repository: version.model_id(),
+            remote_path: "model.safetensors",
+            local_path: "model.safetensors",
+            minimum_size: version.minimum_main_model_size(),
+        },
+        ModelFile {
+            label: "model-config",
+            repository: version.model_id(),
+            remote_path: "config.json",
+            local_path: "config.json",
+            minimum_size: 100,
+        },
+        ModelFile {
+            label: "audio-decoder",
+            repository: "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+            remote_path: "model.safetensors",
+            local_path: "speech_tokenizer/model.safetensors",
+            minimum_size: 500_000_000,
+        },
+        ModelFile {
+            label: "text-tokenizer",
+            repository: "Qwen/Qwen2-0.5B",
+            remote_path: "tokenizer.json",
+            local_path: "tokenizer.json",
+            minimum_size: 1_000_000,
+        },
+    ];
+
+    for file in &model_files {
         let destination = model_dir.join(file.local_path);
         download_file(&client, file, &destination, on_progress)?;
     }
     Ok(model_dir)
 }
 
-fn reuse_hugging_face_main_model(model_dir: &Path) {
+fn reuse_hugging_face_main_model(model_dir: &Path, version: QwenModelVersion) {
     let destination = model_dir.join("model.safetensors");
-    if valid_file(&destination, 100_000_000) {
+    if valid_file(&destination, version.minimum_main_model_size()) {
         return;
     }
     let Some(base_dirs) = BaseDirs::new() else {
@@ -242,23 +306,49 @@ fn reuse_hugging_face_main_model(model_dir: &Path) {
     let snapshots = base_dirs
         .home_dir()
         .join(".cache/huggingface/hub")
-        .join(HF_MODEL_REPO_FOLDER);
+        .join(version.hugging_face_repo_folder());
     let Ok(entries) = std::fs::read_dir(snapshots) else {
         return;
     };
     let Some(existing) = entries
         .flatten()
         .map(|entry| entry.path().join("model.safetensors"))
-        .find(|path| valid_file(path, 100_000_000))
+        .find(|path| valid_file(path, version.minimum_main_model_size()))
         .and_then(|path| std::fs::canonicalize(path).ok())
     else {
         return;
     };
-    let _ = std::fs::remove_file(&destination);
-    if std::fs::hard_link(existing, &destination).is_err() {
-        // A failed hard-link is harmless; the resumable downloader below will
-        // fetch the model into the application-owned cache instead.
+    try_reuse_file(&existing, &destination, version.minimum_main_model_size());
+}
+
+fn reuse_shared_assets(models_dir: &Path, model_dir: &Path, version: QwenModelVersion) {
+    let other_dir = models_dir.join(version.other().cache_folder());
+    for (relative_path, minimum_size) in [
+        ("speech_tokenizer/model.safetensors", 500_000_000),
+        ("tokenizer.json", 1_000_000),
+    ] {
+        try_reuse_file(
+            &other_dir.join(relative_path),
+            &model_dir.join(relative_path),
+            minimum_size,
+        );
     }
+}
+
+fn try_reuse_file(source: &Path, destination: &Path, minimum_size: u64) {
+    if valid_file(destination, minimum_size) || !valid_file(source, minimum_size) {
+        return;
+    }
+    if let Some(parent) = destination.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let _ = std::fs::remove_file(destination);
+    // APFS hard links let the two selectable model caches share the decoder
+    // and tokenizer without consuming another ~660 MB. A failure is harmless;
+    // the resumable downloader below will fetch an independent copy.
+    let _ = std::fs::hard_link(source, destination);
 }
 
 fn download_file(
@@ -475,5 +565,18 @@ mod tests {
         assert!(chunks.len() > 1);
         assert_eq!(chunks.concat(), source);
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 260));
+    }
+
+    #[test]
+    fn model_versions_have_independent_ids_and_cache_sizes() {
+        assert_ne!(
+            QwenModelVersion::Small0_6B.model_id(),
+            QwenModelVersion::Large1_7B.model_id()
+        );
+        assert!(
+            QwenModelVersion::Large1_7B.minimum_main_model_size()
+                > QwenModelVersion::Small0_6B.minimum_main_model_size()
+        );
+        assert_eq!(QwenModelVersion::DEFAULT, QwenModelVersion::Small0_6B);
     }
 }

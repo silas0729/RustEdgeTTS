@@ -5,19 +5,27 @@ mod qwen_local;
 #[path = "../src/timeline_audio.rs"]
 mod timeline_audio;
 
-use qwen_local::{LocalQwenModel, QwenVoice};
+use qwen_local::{LocalQwenModel, QwenModelVersion, QwenVoice};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     configure_macos_proxy();
 
+    let version = match std::env::args().nth(1).as_deref() {
+        Some("1.7") | Some("1.7B") | Some("1.7b") => QwenModelVersion::Large1_7B,
+        Some("0.6") | Some("0.6B") | Some("0.6b") | None => QwenModelVersion::Small0_6B,
+        Some(other) => {
+            return Err(format!("Unsupported model version '{other}'; use 0.6 or 1.7").into());
+        }
+    };
+
     println!(
         "Preparing {} (the first run downloads {})…",
-        qwen_local::MODEL_ID,
-        qwen_local::MODEL_DOWNLOAD_LABEL
+        version.model_id(),
+        version.download_size_label()
     );
     let mut previous_file = "";
     let mut previous_percent = u64::MAX;
-    let model = LocalQwenModel::load(|progress| {
+    let model = LocalQwenModel::load(version, |progress| {
         let percent = progress
             .downloaded_bytes
             .saturating_mul(100)
@@ -60,7 +68,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if decoded.is_empty() {
         return Err("the generated Qwen3 MP3 could not be decoded".into());
     }
-    let output = std::env::temp_dir().join("edge-tts-studio-qwen3-smoke.mp3");
+    let output = std::env::temp_dir().join(format!(
+        "edge-tts-studio-qwen3-{}-smoke.mp3",
+        version.short_label().to_lowercase()
+    ));
     std::fs::write(&output, mp3)?;
     println!(
         "Generated and decoded {:.2}s of local Qwen3 MP3 audio: {}",

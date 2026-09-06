@@ -9,13 +9,16 @@ and keeps long documents inside a dedicated scrollable editor. It can also
 import SRT (including `.str`-named files), WebVTT, ASS/SSA, and LRC subtitles and build an MP3 whose silence
 and speech follow the authored cue timings.
 
-The Qwen3 local mode uses the official
-`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` checkpoint with nine preset voices.
-It supports Chinese, English, mixed Chinese/English text, Japanese, and Korean
-voice presets. The first Qwen generation or preview downloads about 2.4 GB in
-total (the approximately 1.8 GB voice model plus its 12Hz audio decoder and
-tokenizer) to the application cache; later synthesis is local and reuses that
-cache. No Python, PyTorch, ONNX runtime, or external audio encoder is used.
+The Qwen3 local mode lets the user explicitly select either the official
+`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` lightweight checkpoint or the
+`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` higher-quality checkpoint. Both expose
+the same nine preset voices and support Chinese, English, mixed Chinese/English
+text, Japanese, and Korean voice presets. The first generation or preview
+downloads about 2.4 GB for 0.6B or 4.5 GB for 1.7B. Each main model has its own
+cache, while the shared 12Hz decoder and tokenizer are hard-linked on supported
+filesystems to avoid wasting roughly another 660 MB. Only the selected version
+is held in memory. No Python, PyTorch, ONNX runtime, or external audio encoder
+is used.
 
 The second workspace turns an MP3 back into SRT or WebVTT subtitles with a
 local, quantized Whisper Large-v3 Turbo model. Chinese/English mixed recognition
@@ -84,7 +87,8 @@ cargo test
 cargo run --example edge_smoke
 cargo run --example subtitle_smoke
 cargo run --release --example asr_smoke
-cargo run --release --example qwen_smoke
+cargo run --release --example qwen_smoke -- 0.6
+cargo run --release --example qwen_smoke -- 1.7
 ```
 
 The live smoke tests write their MP3 results into the macOS temporary directory
@@ -96,10 +100,12 @@ Hugging Face into the user's Application Support cache; later runs reuse those
 files and transcribe offline.
 
 Qwen3-TTS is substantially larger than the other dependencies, so the normal
-test suite validates engine selection, mixed-language detection, long-text
+test suite validates model-version routing, mixed-language detection, long-text
 segmentation, PCM speed/volume processing, and MP3 encoding without downloading
-the model. A real first-run synthesis is initiated from the app and requires
-enough free disk space and memory for the official checkpoint.
+both models. A real first-run synthesis is initiated from the app and requires
+enough free disk space and memory for the selected official checkpoint. The
+1.7B version uses materially more unified memory than 0.6B, so 0.6B remains the
+safer default on lower-memory Macs.
 
 ## Build the macOS app and installer image
 
@@ -134,7 +140,9 @@ code signing.
 The main thread owns `eframe`/`egui`; all voice discovery, Edge/Qwen synthesis,
 model loading, cache I/O, and MP3 writing run in the background. A dedicated OS
 thread owns a two-thread Tokio runtime, a reusable `EdgeTtsClient`, and an
-on-demand Qwen model. Two `tokio::sync::mpsc` channels
+on-demand Qwen model. When the requested Qwen version differs from the loaded
+one, the worker releases the old model before loading the selected version.
+Two `tokio::sync::mpsc` channels
 carry commands to that worker and results back to the UI. The UI uses
 `try_recv`, so neither voice discovery nor synthesis can block rendering.
 
@@ -179,8 +187,9 @@ proofread before publication. Whisper Large-v3 Turbo and its model
 configuration are MIT-licensed; model files are downloaded from their
 Hugging Face repositories rather than redistributed inside this app.
 
-The official Qwen3-TTS checkpoint is Apache-2.0 licensed and downloaded from
-its Qwen Hugging Face repository rather than bundled in the installer. The
+The official Qwen3-TTS 0.6B and 1.7B CustomVoice checkpoints are Apache-2.0
+licensed and downloaded from their Qwen Hugging Face repositories rather than
+bundled in the installer. The
 `speakers-qwen3-tts` Rust inference backend is a community Candle implementation,
 not an official Qwen Rust SDK. See `SERVICE_AND_VOICE_NOTICE.md` for the separate
 model, voice, generated-content, and noncommercial-project boundaries.
