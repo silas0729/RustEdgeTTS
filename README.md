@@ -20,6 +20,19 @@ filesystems to avoid wasting roughly another 660 MB. Only the selected version
 is held in memory. No Python, PyTorch, ONNX runtime, or external audio encoder
 is used.
 
+Automatic downloading is optional. After selecting Qwen 0.6B or Qwen 1.7B,
+click **Offline model** to import a complete folder downloaded from the official
+[0.6B model repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
+or [1.7B model repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice).
+The app validates that the folder is the selected CustomVoice version and
+requires `model.safetensors`, `config.json`,
+`speech_tokenizer/model.safetensors`, plus either `tokenizer.json` or both
+`vocab.json` and `merges.txt`. Same-volume files are hard-linked into the app
+cache; cross-volume files are copied with progress on the background worker.
+If automatic downloading fails, the app opens this download/import guide
+automatically and also offers the corresponding official ModelScope page for
+users in mainland China.
+
 The second workspace turns an MP3 back into SRT or WebVTT subtitles with a
 local, quantized Whisper Large-v3 Turbo model. Chinese/English mixed recognition
 is the default, with dedicated Chinese-only and English-only modes also
@@ -89,6 +102,8 @@ cargo run --example subtitle_smoke
 cargo run --release --example asr_smoke
 cargo run --release --example qwen_smoke -- 0.6
 cargo run --release --example qwen_smoke -- 1.7
+# Optionally verify importing an already downloaded folder:
+cargo run --release --example qwen_smoke -- 1.7 /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
 
 The live smoke tests write their MP3 results into the macOS temporary directory

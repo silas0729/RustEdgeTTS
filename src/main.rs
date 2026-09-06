@@ -75,6 +75,10 @@ enum WorkerCommand {
         volume_percent: i32,
         output_path: PathBuf,
     },
+    ImportQwenModel {
+        version: QwenModelVersion,
+        source_dir: PathBuf,
+    },
     TranscribeMp3 {
         input_path: PathBuf,
         output_path: PathBuf,
@@ -103,6 +107,21 @@ enum WorkerEvent {
     QwenModelReady {
         version: QwenModelVersion,
         device: String,
+    },
+    QwenModelImportProgress {
+        version: QwenModelVersion,
+        file: String,
+        copied_bytes: u64,
+        total_bytes: u64,
+    },
+    QwenModelImported {
+        version: QwenModelVersion,
+        device: String,
+        model_dir: PathBuf,
+    },
+    QwenModelImportFailed {
+        version: QwenModelVersion,
+        error: String,
     },
     QwenModelReleased,
     QwenProgress {
@@ -173,6 +192,53 @@ struct QwenSelection {
 enum WorkspaceMode {
     TextToSpeech,
     AudioToSubtitles,
+}
+
+/// Vertical metrics for the left TTS card. The default macOS window leaves
+/// roughly 565 px for the workspace. Qwen's offline-model row adds one more
+/// line than Edge, so use a compact rhythm at that height instead of letting
+/// the preview button run underneath the fixed action footer.
+#[derive(Clone, Copy, Debug)]
+struct VoiceCardLayout {
+    engine_gap: f32,
+    field_gap: f32,
+    combo_summary_gap: f32,
+    section_gap: f32,
+    metadata_height: f32,
+    settings_margin: i8,
+    preview_margin: i8,
+    waveform_height: f32,
+    preview_button_height: f32,
+}
+
+impl VoiceCardLayout {
+    fn for_height(card_height: f32) -> Self {
+        if card_height < 590.0 {
+            Self {
+                engine_gap: 6.0,
+                field_gap: 6.0,
+                combo_summary_gap: 5.0,
+                section_gap: 5.0,
+                metadata_height: 26.0,
+                settings_margin: 8,
+                preview_margin: 6,
+                waveform_height: 18.0,
+                preview_button_height: 30.0,
+            }
+        } else {
+            Self {
+                engine_gap: 8.0,
+                field_gap: 10.0,
+                combo_summary_gap: 9.0,
+                section_gap: 8.0,
+                metadata_height: 30.0,
+                settings_margin: 10,
+                preview_margin: 8,
+                waveform_height: 22.0,
+                preview_button_height: 34.0,
+            }
+        }
+    }
 }
 
 enum GenerationContent {
@@ -471,6 +537,7 @@ struct TtsApp {
     qwen_model_preparing: bool,
     qwen_model_ready: Option<QwenModelVersion>,
     qwen_device: Option<String>,
+    qwen_manual_help_open: bool,
     previewing: bool,
     generating: bool,
     last_generated_audio: Option<PathBuf>,
@@ -538,6 +605,7 @@ impl TtsApp {
             qwen_model_preparing: false,
             qwen_model_ready: None,
             qwen_device: None,
+            qwen_manual_help_open: false,
             previewing: false,
             generating: false,
             last_generated_audio: None,
@@ -648,25 +716,7 @@ impl TtsApp {
                         "text-tokenizer" => ("Qwen 文本分词器", "Qwen text tokenizer"),
                         _ => ("Qwen3 模型文件", "Qwen3 model file"),
                     };
-                    let progress = if total_bytes > 0 {
-                        if total_bytes < 1_048_576 {
-                            format!(
-                                "{:.0}% · {:.0}/{:.0} KB",
-                                downloaded_bytes as f64 / total_bytes as f64 * 100.0,
-                                downloaded_bytes as f64 / 1_024.0,
-                                total_bytes as f64 / 1_024.0
-                            )
-                        } else {
-                            format!(
-                                "{:.0}% · {:.0}/{:.0} MB",
-                                downloaded_bytes as f64 / total_bytes as f64 * 100.0,
-                                downloaded_bytes as f64 / 1_048_576.0,
-                                total_bytes as f64 / 1_048_576.0
-                            )
-                        }
-                    } else {
-                        format!("{:.0} MB", downloaded_bytes as f64 / 1_048_576.0)
-                    };
+                    let progress = format_transfer_progress(downloaded_bytes, total_bytes);
                     self.status = Some(StatusMessage::new(
                         StatusKind::Info,
                         format!(
@@ -697,6 +747,72 @@ impl TtsApp {
                         ),
                     ));
                 }
+                WorkerEvent::QwenModelImportProgress {
+                    version,
+                    file,
+                    copied_bytes,
+                    total_bytes,
+                } => {
+                    self.qwen_model_preparing = true;
+                    let localized_file = match file.as_str() {
+                        "main-model" => ("Qwen3 主模型", "Qwen3 main model"),
+                        "model-config" => ("Qwen3 配置", "Qwen3 configuration"),
+                        "audio-decoder" => ("12Hz 音频解码器", "12Hz audio decoder"),
+                        "text-tokenizer" => ("Qwen 文本分词器", "Qwen text tokenizer"),
+                        _ => ("Qwen3 模型文件", "Qwen3 model file"),
+                    };
+                    let progress = format_transfer_progress(copied_bytes, total_bytes);
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        format!(
+                            "正在导入 Qwen3 {} {}：{progress}",
+                            version.short_label(),
+                            localized_file.0
+                        ),
+                        format!(
+                            "Importing Qwen3 {} {}: {progress}",
+                            version.short_label(),
+                            localized_file.1
+                        ),
+                    ));
+                }
+                WorkerEvent::QwenModelImported {
+                    version,
+                    device,
+                    model_dir,
+                } => {
+                    self.qwen_model_preparing = false;
+                    self.qwen_model_ready = Some(version);
+                    self.qwen_device = Some(device.clone());
+                    self.qwen_manual_help_open = false;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Success,
+                        format!(
+                            "已导入并加载 Qwen3-TTS {}（{device}）：{}",
+                            version.short_label(),
+                            model_dir.display()
+                        ),
+                        format!(
+                            "Imported and loaded Qwen3-TTS {} on {device}: {}",
+                            version.short_label(),
+                            model_dir.display()
+                        ),
+                    ));
+                }
+                WorkerEvent::QwenModelImportFailed { version, error } => {
+                    self.qwen_model_preparing = false;
+                    self.qwen_model_ready = None;
+                    self.qwen_device = None;
+                    self.qwen_manual_help_open = true;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Error,
+                        format!("Qwen3 {} 离线模型导入失败：{error}", version.short_label()),
+                        format!(
+                            "Could not import the Qwen3 {} offline model: {error}",
+                            version.short_label()
+                        ),
+                    ));
+                }
                 WorkerEvent::QwenModelReleased => {
                     self.qwen_model_preparing = false;
                     self.qwen_model_ready = None;
@@ -719,6 +835,9 @@ impl TtsApp {
                     ));
                 }
                 WorkerEvent::PreviewFailed(error) => {
+                    if self.qwen_model_preparing && self.tts_engine == TtsEngine::Qwen3Local {
+                        self.qwen_manual_help_open = true;
+                    }
                     self.qwen_model_preparing = false;
                     self.previewing = false;
                     self.status = Some(StatusMessage::new(
@@ -881,6 +1000,9 @@ impl TtsApp {
                     ));
                 }
                 WorkerEvent::GenerationFailed(error) => {
+                    if self.qwen_model_preparing && self.tts_engine == TtsEngine::Qwen3Local {
+                        self.qwen_manual_help_open = true;
+                    }
                     self.qwen_model_preparing = false;
                     self.generating = false;
                     self.subtitle_progress = None;
@@ -932,6 +1054,53 @@ impl TtsApp {
                     StatusKind::Error,
                     "语音服务已停止，请重新启动应用。",
                     "The TTS worker is no longer running.",
+                ));
+            }
+        }
+    }
+
+    fn import_selected_qwen_model(&mut self) {
+        if self.tts_engine != TtsEngine::Qwen3Local || self.tts_controls_busy() {
+            return;
+        }
+        let version = self.selected_qwen_version;
+        let Some(source_dir) = rfd::FileDialog::new()
+            .set_title(self.ui_language.text(
+                "选择完整的 Qwen3-TTS 模型文件夹",
+                "Choose the complete Qwen3-TTS model folder",
+            ))
+            .pick_folder()
+        else {
+            return;
+        };
+
+        match self.command_tx.send(WorkerCommand::ImportQwenModel {
+            version,
+            source_dir: source_dir.clone(),
+        }) {
+            Ok(()) => {
+                self.qwen_model_preparing = true;
+                self.qwen_model_ready = None;
+                self.qwen_device = None;
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Info,
+                    format!(
+                        "正在检查并导入 Qwen3-TTS {}：{}",
+                        version.short_label(),
+                        source_dir.display()
+                    ),
+                    format!(
+                        "Checking and importing Qwen3-TTS {}: {}",
+                        version.short_label(),
+                        source_dir.display()
+                    ),
+                ));
+            }
+            Err(_) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "后台服务已停止，请重新启动应用。",
+                    "The background worker stopped. Restart the app.",
                 ));
             }
         }
@@ -1434,10 +1603,132 @@ impl eframe::App for TtsApp {
                         }
                     });
             });
+        if self.qwen_manual_help_open {
+            let context = ui.ctx().clone();
+            self.show_qwen_manual_help(&context, language);
+        }
     }
 }
 
 impl TtsApp {
+    fn show_qwen_manual_help(&mut self, context: &egui::Context, language: UiLanguage) {
+        let version = self.selected_qwen_version;
+        let mut open = self.qwen_manual_help_open;
+        let mut import_clicked = false;
+        let hf_command = format!(
+            "huggingface-cli download {} --local-dir {}",
+            version.model_id(),
+            version.model_folder_name()
+        );
+        let modelscope_command = format!(
+            "modelscope download --model {} --local_dir {}",
+            version.model_id(),
+            version.model_folder_name()
+        );
+
+        egui::Window::new(language.text("离线模型下载与导入", "Offline model download and import"))
+            .id(egui::Id::new("qwen-offline-model-help"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(context, |ui| {
+                ui.label(
+                    egui::RichText::new(match language {
+                        UiLanguage::Chinese => format!(
+                            "自动下载失败时，请从下面任一官方模型页面下载完整的 Qwen3-TTS {} CustomVoice 文件夹。",
+                            version.short_label()
+                        ),
+                        UiLanguage::English => format!(
+                            "If automatic download fails, download the complete Qwen3-TTS {} CustomVoice folder from either official model page below.",
+                            version.short_label()
+                        ),
+                    })
+                    .size(13.0)
+                    .color(TEXT_PRIMARY),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("Hugging Face", version.hugging_face_url());
+                    ui.label("·");
+                    ui.hyperlink_to("ModelScope（中国大陆）", version.model_scope_url());
+                });
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(language.text(
+                        "推荐命令（二选一）：",
+                        "Recommended commands (choose one):",
+                    ))
+                    .strong()
+                    .color(TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(&hf_command)
+                        .monospace()
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
+                );
+                ui.label(
+                    egui::RichText::new(&modelscope_command)
+                        .monospace()
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(language.text(
+                        "所选文件夹至少需要：",
+                        "The selected folder must contain:",
+                    ))
+                    .strong()
+                    .color(TEXT_PRIMARY),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "model.safetensors\nconfig.json\nspeech_tokenizer/model.safetensors\ntokenizer.json  或  vocab.json + merges.txt",
+                    )
+                    .monospace()
+                    .size(11.0)
+                    .color(TEXT_SECONDARY),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(language.text(
+                        "请选择完整模型文件夹，不要只选择或只下载 model.safetensors。程序会校验 0.6B/1.7B 是否与当前选择一致，并优先使用硬链接安装；跨磁盘时会在后台复制。",
+                        "Choose the complete model folder, not only model.safetensors. The app validates that 0.6B/1.7B matches the current selection and installs with hard links when possible; cross-volume files are copied in the background.",
+                    ))
+                    .size(12.0)
+                    .color(TEXT_SECONDARY),
+                );
+                ui.add_space(12.0);
+                if ui
+                    .add_enabled(
+                        !self.tts_controls_busy(),
+                        egui::Button::new(
+                            egui::RichText::new(language.text(
+                                "选择模型文件夹并导入",
+                                "Choose model folder and import",
+                            ))
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                        )
+                        .fill(PRIMARY)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(8)
+                        .min_size(egui::vec2(190.0, 36.0)),
+                    )
+                    .clicked()
+                {
+                    import_clicked = true;
+                }
+            });
+        self.qwen_manual_help_open = open && !import_clicked;
+        if import_clicked {
+            self.import_selected_qwen_model();
+        }
+    }
+
     fn show_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (icon_rect, _) =
@@ -1538,6 +1829,7 @@ impl TtsApp {
     }
 
     fn show_voice_card(&mut self, ui: &mut egui::Ui, language: UiLanguage, card_height: f32) {
+        let layout = VoiceCardLayout::for_height(card_height);
         card_frame().show(ui, |ui| {
             ui.set_min_height((card_height - 36.0).max(0.0));
             let operation_busy = self.previewing
@@ -1598,7 +1890,7 @@ impl TtsApp {
                     .color(TEXT_SECONDARY),
             );
 
-            ui.add_space(8.0);
+            ui.add_space(layout.engine_gap);
             let previous_engine = self.tts_engine;
             let mut chosen_engine = None;
             egui::Frame::new()
@@ -1662,7 +1954,7 @@ impl TtsApp {
                 }
             }
 
-            ui.add_space(10.0);
+            ui.add_space(layout.field_gap);
             ui.add_enabled_ui(!busy, |ui| {
                 input_frame().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1719,7 +2011,7 @@ impl TtsApp {
                     });
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(layout.field_gap);
                 let selected_text = self.selected_voice_label();
                 let mut edge_selection = self.selected_voice;
                 let mut qwen_selection = self.selected_qwen_voice;
@@ -1777,7 +2069,7 @@ impl TtsApp {
                 self.selected_qwen_voice = qwen_selection;
             });
 
-            ui.add_space(9.0);
+            ui.add_space(layout.combo_summary_gap);
             let matching = self.matching_voice_count();
             let summary = match (self.tts_engine, language) {
                 (TtsEngine::Edge, UiLanguage::Chinese) => {
@@ -1794,12 +2086,12 @@ impl TtsApp {
                     let state = if self.qwen_model_ready == Some(self.selected_qwen_version) {
                         self.qwen_device.as_deref().unwrap_or("本地设备")
                     } else if self.qwen_model_preparing {
-                        "正在准备模型"
+                        "准备中"
                     } else {
-                        "按需加载，首次使用需下载"
+                        "待加载"
                     };
                     format!(
-                        "Qwen3 {} · {matching}/9 个音色 · {state}",
+                        "Qwen3 {} · {matching}/9 音色 · {state}",
                         self.selected_qwen_version.short_label()
                     )
                 }
@@ -1807,9 +2099,9 @@ impl TtsApp {
                     let state = if self.qwen_model_ready == Some(self.selected_qwen_version) {
                         self.qwen_device.as_deref().unwrap_or("local device")
                     } else if self.qwen_model_preparing {
-                        "preparing model"
+                        "preparing"
                     } else {
-                        "loads on demand; downloads on first use"
+                        "not loaded"
                     };
                     format!(
                         "Qwen3 {} · {matching}/9 voices · {state}",
@@ -1817,18 +2109,74 @@ impl TtsApp {
                     )
                 }
             };
-            ui.label(
-                egui::RichText::new(summary)
-                    .size(12.0)
-                    .color(TEXT_SECONDARY),
-            );
+            if self.tts_engine == TtsEngine::Qwen3Local {
+                ui.horizontal(|ui| {
+                    let gap = ui.spacing().item_spacing.x;
+                    let import_width = match language {
+                        UiLanguage::Chinese => 96.0,
+                        UiLanguage::English => 104.0,
+                    };
+                    let summary_width =
+                        (ui.available_width() - import_width - 30.0 - gap * 2.0).max(100.0);
+                    ui.add_sized(
+                        egui::vec2(summary_width, layout.metadata_height),
+                        egui::Label::new(
+                            egui::RichText::new(&summary)
+                                .size(12.0)
+                                .color(TEXT_SECONDARY),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&summary);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("?").size(12.0).strong().color(PRIMARY),
+                            )
+                            .fill(EDITOR_BACKGROUND)
+                            .stroke(egui::Stroke::new(1.0, BORDER))
+                            .corner_radius(8)
+                            .min_size(egui::vec2(30.0, layout.metadata_height)),
+                        )
+                        .on_hover_text(language.text(
+                            "查看离线模型下载说明",
+                            "Show offline model download instructions",
+                        ))
+                        .clicked()
+                    {
+                        self.qwen_manual_help_open = true;
+                    }
+                    let import = egui::Button::new(
+                        egui::RichText::new(language.text("＋ 离线模型", "+ Offline model"))
+                            .size(11.0)
+                            .strong()
+                            .color(PRIMARY),
+                    )
+                    .fill(PRIMARY_SOFT)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(205, 214, 255),
+                    ))
+                    .corner_radius(8)
+                    .min_size(egui::vec2(import_width, layout.metadata_height));
+                    if ui.add_enabled(!busy, import).clicked() {
+                        self.import_selected_qwen_model();
+                    }
+                });
+            } else {
+                ui.label(
+                    egui::RichText::new(summary)
+                        .size(12.0)
+                        .color(TEXT_SECONDARY),
+                );
+            }
 
-            ui.add_space(8.0);
+            ui.add_space(layout.section_gap);
             egui::Frame::new()
                 .fill(EDITOR_BACKGROUND)
                 .stroke(egui::Stroke::new(1.0, BORDER))
                 .corner_radius(10)
-                .inner_margin(egui::Margin::same(10))
+                .inner_margin(egui::Margin::same(layout.settings_margin))
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.spacing_mut().interact_size.y = 26.0;
@@ -1869,7 +2217,7 @@ impl TtsApp {
                     );
                 });
 
-            ui.add_space(8.0);
+            ui.add_space(layout.section_gap);
             egui::Frame::new()
                 .fill(PRIMARY_SOFT)
                 .stroke(egui::Stroke::new(
@@ -1877,7 +2225,7 @@ impl TtsApp {
                     egui::Color32::from_rgb(213, 220, 255),
                 ))
                 .corner_radius(11)
-                .inner_margin(egui::Margin::same(8))
+                .inner_margin(egui::Margin::same(layout.preview_margin))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1899,7 +2247,7 @@ impl TtsApp {
                     ui.add_space(2.0);
 
                     let (waveform_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 22.0),
+                        egui::vec2(ui.available_width(), layout.waveform_height),
                         egui::Sense::hover(),
                     );
                     paint_preview_waveform(ui, waveform_rect, self.previewing);
@@ -1931,7 +2279,7 @@ impl TtsApp {
                         egui::Stroke::new(1.0, BORDER)
                     })
                     .corner_radius(9)
-                    .min_size(egui::vec2(ui.available_width(), 34.0));
+                    .min_size(egui::vec2(ui.available_width(), layout.preview_button_height));
 
                     if ui.add(preview_button).clicked() && can_preview {
                         self.start_preview();
@@ -2954,6 +3302,27 @@ fn format_duration_seconds(seconds: u64) -> String {
     }
 }
 
+fn format_transfer_progress(current_bytes: u64, total_bytes: u64) -> String {
+    if total_bytes == 0 {
+        return format!("{:.0} MB", current_bytes as f64 / 1_048_576.0);
+    }
+    if total_bytes < 1_048_576 {
+        format!(
+            "{:.0}% · {:.0}/{:.0} KB",
+            current_bytes as f64 / total_bytes as f64 * 100.0,
+            current_bytes as f64 / 1_024.0,
+            total_bytes as f64 / 1_024.0
+        )
+    } else {
+        format!(
+            "{:.0}% · {:.0}/{:.0} MB",
+            current_bytes as f64 / total_bytes as f64 * 100.0,
+            current_bytes as f64 / 1_048_576.0,
+            total_bytes as f64 / 1_048_576.0
+        )
+    }
+}
+
 fn adjustment_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -3244,6 +3613,21 @@ fn spawn_tts_worker() -> (
                                 .await;
                             }
                         },
+                        WorkerCommand::ImportQwenModel {
+                            version,
+                            source_dir,
+                        } => {
+                            whisper_model = None;
+                            if qwen_model.take().is_some() {
+                                let _ = thread_event_tx.send(WorkerEvent::QwenModelReleased);
+                            }
+                            import_qwen_model_locally(
+                                &mut qwen_model,
+                                &thread_event_tx,
+                                version,
+                                &source_dir,
+                            );
+                        }
                         WorkerCommand::TranscribeMp3 {
                             input_path,
                             output_path,
@@ -3273,6 +3657,44 @@ fn spawn_tts_worker() -> (
         .map(|error| format!("Could not start the TTS worker thread: {error}"));
 
     (command_tx, event_rx, startup_error)
+}
+
+fn import_qwen_model_locally(
+    model_cache: &mut Option<LocalQwenModel>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    version: QwenModelVersion,
+    source_dir: &Path,
+) {
+    let progress_tx = event_tx.clone();
+    let model_dir = match qwen_local::import_offline_model(version, source_dir, move |progress| {
+        let _ = progress_tx.send(WorkerEvent::QwenModelImportProgress {
+            version,
+            file: progress.file.to_owned(),
+            copied_bytes: progress.downloaded_bytes,
+            total_bytes: progress.total_bytes,
+        });
+    }) {
+        Ok(model_dir) => model_dir,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::QwenModelImportFailed { version, error });
+            return;
+        }
+    };
+
+    match LocalQwenModel::load(version, |_| {}) {
+        Ok(model) => {
+            let device = model.device_label().to_owned();
+            *model_cache = Some(model);
+            let _ = event_tx.send(WorkerEvent::QwenModelImported {
+                version,
+                device,
+                model_dir,
+            });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::QwenModelImportFailed { version, error });
+        }
+    }
 }
 
 async fn preview_voice(
@@ -4146,5 +4568,18 @@ mod tests {
         assert_eq!(signed_percent(-25), "-25%");
         assert_eq!(signed_percent(0), "+0%");
         assert_eq!(signed_percent(80), "+80%");
+    }
+
+    #[test]
+    fn voice_card_compacts_at_the_default_macos_workspace_height() {
+        let compact = VoiceCardLayout::for_height(565.0);
+        let roomy = VoiceCardLayout::for_height(640.0);
+
+        assert!(compact.field_gap < roomy.field_gap);
+        assert!(compact.metadata_height < roomy.metadata_height);
+        assert!(compact.settings_margin < roomy.settings_margin);
+        assert!(compact.preview_margin < roomy.preview_margin);
+        assert!(compact.waveform_height < roomy.waveform_height);
+        assert!(compact.preview_button_height < roomy.preview_button_height);
     }
 }

@@ -40,6 +40,8 @@ Microsoft、Microsoft Edge、Edge Read Aloud 以及相关名称和音色属于�
 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 或
 `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`。两个模型由 Qwen 团队发布，模型页面均标注为 Apache License 2.0；模型文件不包含在本项目安装包中。应用只加载用户当前选择的版本，0.6B 首次约需下载 2.4 GB，1.7B 首次约需下载 4.5 GB。`speakers-qwen3-tts` 是基于 Candle 的社区 Rust 推理实现，并非 Qwen 官方 Rust SDK。
 
+模型既可由应用从官方 Hugging Face 仓库自动下载，也可由用户从 Hugging Face 或 ModelScope 官方页面完整下载后，通过“离线模型”按钮导入。导入操作会检查 CustomVoice 类型、0.6B/1.7B 版本和必要文件；不接受来源不明、文件不完整或版本不匹配的目录。应用不会将本地模型文件上传到任何服务。
+
 Qwen3-TTS 模型、模型名称、预设音色、推理组件和生成内容分别受其适用许可证、模型条款及法律约束。本项目的 PolyForm Noncommercial 许可证仍然只允许将本项目作者代码用于个人学习和非商业研究；第三方组件采用更宽松许可证，并不会自动扩大本项目许可证授予的用途。
 
 用户不得使用 Qwen3-TTS 或任何预设音色冒充真实个人、制作欺骗性内容、侵犯声音权、人格权或著作权，或从事法律禁止的行为。对外发布前应人工试听并核对文本、发音、语种和字幕时间轴。

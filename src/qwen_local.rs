@@ -29,6 +29,27 @@ impl QwenModelVersion {
         }
     }
 
+    pub fn model_folder_name(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            Self::Large1_7B => "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        }
+    }
+
+    pub fn hugging_face_url(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            Self::Large1_7B => "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        }
+    }
+
+    pub fn model_scope_url(self) -> &'static str {
+        match self {
+            Self::Small0_6B => "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            Self::Large1_7B => "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        }
+    }
+
     pub fn download_size_label(self) -> &'static str {
         match self {
             Self::Small0_6B => "2.4 GB",
@@ -54,6 +75,13 @@ impl QwenModelVersion {
         match self {
             Self::Small0_6B => 1_500_000_000,
             Self::Large1_7B => 3_500_000_000,
+        }
+    }
+
+    fn expected_hidden_size(self) -> u64 {
+        match self {
+            Self::Small0_6B => 1024,
+            Self::Large1_7B => 2048,
         }
     }
 
@@ -289,10 +317,251 @@ fn prepare_model_files(
     ];
 
     for file in &model_files {
+        if file.label == "text-tokenizer" && has_usable_text_tokenizer(&model_dir) {
+            continue;
+        }
         let destination = model_dir.join(file.local_path);
         download_file(&client, file, &destination, on_progress)?;
     }
+    validate_ready_model_dir(&model_dir, version)?;
     Ok(model_dir)
+}
+
+/// Installs a complete model folder selected by the user into the app cache.
+/// Files are hard-linked when possible, otherwise copied with progress. This
+/// makes future launches independent from the originally selected directory.
+pub fn import_offline_model(
+    version: QwenModelVersion,
+    selected_dir: &Path,
+    mut on_progress: impl FnMut(DownloadProgress),
+) -> Result<PathBuf, String> {
+    let source_dir = locate_model_source(selected_dir, version)?;
+    validate_model_config(&source_dir.join("config.json"), version)?;
+
+    let project_dirs = ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
+        .ok_or_else(|| "无法确定 Qwen3-TTS 模型缓存目录。".to_owned())?;
+    let models_dir = project_dirs.cache_dir().join("models");
+    let destination_dir = models_dir.join(version.cache_folder());
+    std::fs::create_dir_all(&destination_dir)
+        .map_err(|error| format!("无法创建本地模型目录：{error}"))?;
+
+    import_file(
+        &source_dir.join("model.safetensors"),
+        &destination_dir.join("model.safetensors"),
+        "main-model",
+        version.minimum_main_model_size(),
+        &mut on_progress,
+    )?;
+    import_file(
+        &source_dir.join("config.json"),
+        &destination_dir.join("config.json"),
+        "model-config",
+        100,
+        &mut on_progress,
+    )?;
+
+    let source_decoder = source_dir.join("speech_tokenizer/model.safetensors");
+    if valid_file(&source_decoder, 500_000_000) {
+        import_file(
+            &source_decoder,
+            &destination_dir.join("speech_tokenizer/model.safetensors"),
+            "audio-decoder",
+            500_000_000,
+            &mut on_progress,
+        )?;
+    }
+
+    let source_tokenizer = source_dir.join("tokenizer.json");
+    if valid_file(&source_tokenizer, 1_000_000) {
+        import_file(
+            &source_tokenizer,
+            &destination_dir.join("tokenizer.json"),
+            "text-tokenizer",
+            1_000_000,
+            &mut on_progress,
+        )?;
+    } else {
+        for (name, minimum_size) in [
+            ("vocab.json", 100_000),
+            ("merges.txt", 100_000),
+            ("tokenizer_config.json", 100),
+        ] {
+            let source = source_dir.join(name);
+            if valid_file(&source, minimum_size) {
+                import_file(
+                    &source,
+                    &destination_dir.join(name),
+                    "text-tokenizer",
+                    minimum_size,
+                    &mut on_progress,
+                )?;
+            }
+        }
+    }
+
+    reuse_shared_assets(&models_dir, &destination_dir, version);
+    validate_ready_model_dir(&destination_dir, version)?;
+    Ok(destination_dir)
+}
+
+fn locate_model_source(selected_dir: &Path, version: QwenModelVersion) -> Result<PathBuf, String> {
+    let direct = selected_dir.to_path_buf();
+    let nested = selected_dir.join(version.model_folder_name());
+    let source = if direct.join("model.safetensors").is_file() {
+        direct
+    } else if nested.join("model.safetensors").is_file() {
+        nested
+    } else {
+        return Err(format!(
+            "所选文件夹中没有找到 {} 的 model.safetensors。请选择完整模型文件夹，而不是单个文件。",
+            version.model_folder_name()
+        ));
+    };
+    Ok(source)
+}
+
+fn validate_model_config(config_path: &Path, version: QwenModelVersion) -> Result<(), String> {
+    let bytes =
+        std::fs::read(config_path).map_err(|error| format!("无法读取模型 config.json：{error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("模型 config.json 格式无效：{error}"))?;
+    validate_model_config_value(&value, version)
+}
+
+fn validate_model_config_value(
+    value: &serde_json::Value,
+    version: QwenModelVersion,
+) -> Result<(), String> {
+    let model_type = value
+        .get("tts_model_type")
+        .and_then(serde_json::Value::as_str);
+    if model_type != Some("custom_voice") {
+        return Err("所选目录不是 Qwen3-TTS CustomVoice 模型。".to_owned());
+    }
+    let hidden_size = value
+        .pointer("/talker_config/hidden_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "config.json 缺少 talker_config.hidden_size。".to_owned())?;
+    if hidden_size != version.expected_hidden_size() {
+        let detected = if hidden_size == QwenModelVersion::Small0_6B.expected_hidden_size() {
+            "0.6B"
+        } else if hidden_size == QwenModelVersion::Large1_7B.expected_hidden_size() {
+            "1.7B"
+        } else {
+            "未知版本"
+        };
+        return Err(format!(
+            "模型版本不匹配：当前选择 {}，但文件夹内检测为 {detected}。",
+            version.short_label()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ready_model_dir(model_dir: &Path, version: QwenModelVersion) -> Result<(), String> {
+    validate_model_config(&model_dir.join("config.json"), version)?;
+    if !valid_file(
+        &model_dir.join("model.safetensors"),
+        version.minimum_main_model_size(),
+    ) {
+        return Err("主模型 model.safetensors 缺失或不完整。".to_owned());
+    }
+    if !valid_file(
+        &model_dir.join("speech_tokenizer/model.safetensors"),
+        500_000_000,
+    ) {
+        return Err(
+            "缺少 speech_tokenizer/model.safetensors；请下载完整模型仓库后再导入。".to_owned(),
+        );
+    }
+    if !has_usable_text_tokenizer(model_dir) {
+        return Err(
+            "缺少文本分词器；需要 tokenizer.json，或同时提供 vocab.json 与 merges.txt。".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn has_usable_text_tokenizer(model_dir: &Path) -> bool {
+    valid_file(&model_dir.join("tokenizer.json"), 1_000_000)
+        || (valid_file(&model_dir.join("vocab.json"), 100_000)
+            && valid_file(&model_dir.join("merges.txt"), 100_000))
+}
+
+fn import_file(
+    source: &Path,
+    destination: &Path,
+    label: &'static str,
+    minimum_size: u64,
+    on_progress: &mut impl FnMut(DownloadProgress),
+) -> Result<(), String> {
+    if !valid_file(source, minimum_size) {
+        return Err(format!("{} 缺失或不完整：{}", label, source.display()));
+    }
+    let source_size = std::fs::metadata(source)
+        .map_err(|error| format!("无法读取 {}：{error}", source.display()))?
+        .len();
+    if source == destination || valid_file(destination, minimum_size) {
+        on_progress(DownloadProgress {
+            file: label,
+            downloaded_bytes: source_size,
+            total_bytes: source_size,
+        });
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建本地模型目录：{error}"))?;
+    }
+    let part_path = destination.with_extension("import");
+    let _ = std::fs::remove_file(&part_path);
+    let resolved_source = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    if std::fs::hard_link(&resolved_source, &part_path).is_err() {
+        let mut input = std::fs::File::open(source)
+            .map_err(|error| format!("无法打开 {}：{error}", source.display()))?;
+        let mut output = std::fs::File::create(&part_path)
+            .map_err(|error| format!("无法写入 {}：{error}", part_path.display()))?;
+        let mut copied = 0_u64;
+        let mut last_reported = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let count = input
+                .read(&mut buffer)
+                .map_err(|error| format!("读取离线模型失败：{error}"))?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("复制离线模型失败：{error}"))?;
+            copied = copied.saturating_add(count as u64);
+            if copied.saturating_sub(last_reported) >= 8 * 1024 * 1024 || copied == source_size {
+                on_progress(DownloadProgress {
+                    file: label,
+                    downloaded_bytes: copied,
+                    total_bytes: source_size,
+                });
+                last_reported = copied;
+            }
+        }
+        output
+            .flush()
+            .map_err(|error| format!("写入离线模型失败：{error}"))?;
+    } else {
+        on_progress(DownloadProgress {
+            file: label,
+            downloaded_bytes: source_size,
+            total_bytes: source_size,
+        });
+    }
+    if !valid_file(&part_path, minimum_size) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!("导入后的 {label} 不完整。"));
+    }
+    let _ = std::fs::remove_file(destination);
+    std::fs::rename(&part_path, destination)
+        .map_err(|error| format!("无法安装 {label}：{error}"))?;
+    Ok(())
 }
 
 fn reuse_hugging_face_main_model(model_dir: &Path, version: QwenModelVersion) {
@@ -578,5 +847,26 @@ mod tests {
                 > QwenModelVersion::Small0_6B.minimum_main_model_size()
         );
         assert_eq!(QwenModelVersion::DEFAULT, QwenModelVersion::Small0_6B);
+    }
+
+    #[test]
+    fn offline_config_must_match_the_selected_custom_voice_version() {
+        let small = serde_json::json!({
+            "tts_model_type": "custom_voice",
+            "talker_config": { "hidden_size": 1024 }
+        });
+        let large = serde_json::json!({
+            "tts_model_type": "custom_voice",
+            "talker_config": { "hidden_size": 2048 }
+        });
+        let base = serde_json::json!({
+            "tts_model_type": "base",
+            "talker_config": { "hidden_size": 1024 }
+        });
+
+        assert!(validate_model_config_value(&small, QwenModelVersion::Small0_6B).is_ok());
+        assert!(validate_model_config_value(&large, QwenModelVersion::Large1_7B).is_ok());
+        assert!(validate_model_config_value(&small, QwenModelVersion::Large1_7B).is_err());
+        assert!(validate_model_config_value(&base, QwenModelVersion::Small0_6B).is_err());
     }
 }

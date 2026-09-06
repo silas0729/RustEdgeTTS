@@ -17,6 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("Unsupported model version '{other}'; use 0.6 or 1.7").into());
         }
     };
+    if let Some(source_dir) = std::env::args().nth(2) {
+        println!("Importing offline model folder: {source_dir}");
+        let installed =
+            qwen_local::import_offline_model(version, std::path::Path::new(&source_dir), |_| {})?;
+        println!("Offline model installed at {}.", installed.display());
+    }
 
     println!(
         "Preparing {} (the first run downloads {})…",
