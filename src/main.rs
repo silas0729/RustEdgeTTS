@@ -1730,6 +1730,10 @@ impl TtsApp {
                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                     )
                     .show(ui, |ui| {
+                        // Keep the first CJK glyph row clear of the scroll area's
+                        // top clip edge. macOS font ascenders can otherwise lose
+                        // a pixel or two when the row starts exactly at y = 0.
+                        ui.add_space(5.0);
                         ui.add_enabled(
                             !self.generating,
                             egui::TextEdit::multiline(&mut self.text)
@@ -1737,7 +1741,7 @@ impl TtsApp {
                                 .desired_rows(10)
                                 .cursor_at_end(false)
                                 .frame(egui::Frame::NONE)
-                                .margin(egui::Margin::symmetric(4, 3))
+                                .margin(egui::Margin::symmetric(5, 7))
                                 .text_color(TEXT_PRIMARY)
                                 .hint_text(language.text(
                                     "在这里输入或粘贴需要转换的文字…",
@@ -1883,10 +1887,13 @@ impl TtsApp {
                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                     )
                     .show(ui, |ui| {
+                        // Separate the first row from the ScrollArea clip edge so
+                        // Chinese glyph ascenders are never cut off on macOS.
+                        ui.add_space(5.0);
                         for (index, cue) in track.cues.iter().enumerate() {
                             ui.horizontal_top(|ui| {
                                 ui.add_sized(
-                                    [34.0, 22.0],
+                                    [34.0, 26.0],
                                     egui::Label::new(
                                         egui::RichText::new(format!("{}", index + 1))
                                             .size(11.0)
@@ -1894,7 +1901,7 @@ impl TtsApp {
                                     ),
                                 );
                                 ui.add_sized(
-                                    [150.0, 22.0],
+                                    [150.0, 26.0],
                                     egui::Label::new(
                                         egui::RichText::new(format!(
                                             "{} – {}",
@@ -2236,10 +2243,13 @@ impl TtsApp {
                                 egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                             )
                             .show(ui, |ui| {
+                                // The scroll clip starts exactly at the first row;
+                                // add a small safe area for CJK font ascenders.
+                                ui.add_space(5.0);
                                 for (index, cue) in self.transcription_cues.iter().enumerate() {
                                     ui.horizontal_top(|ui| {
                                         ui.add_sized(
-                                            [30.0, 22.0],
+                                            [30.0, 26.0],
                                             egui::Label::new(
                                                 egui::RichText::new(format!("{}", index + 1))
                                                     .size(11.0)
@@ -2247,7 +2257,7 @@ impl TtsApp {
                                             ),
                                         );
                                         ui.add_sized(
-                                            [142.0, 22.0],
+                                            [142.0, 26.0],
                                             egui::Label::new(
                                                 egui::RichText::new(format!(
                                                     "{} – {}",
