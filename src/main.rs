@@ -2326,8 +2326,8 @@ impl TtsApp {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(language.text(
-                "隐私说明：识别时不调用云端 API，音频和字幕均保留在本机。",
-                "Privacy: no cloud API is used; audio and subtitles stay on this Mac.",
+                "仅供个人学习与非商业研究，禁止商业使用；识别时音频和字幕均保留在本机。",
+                "Personal learning and noncommercial research only; transcription stays local.",
             ))
             .size(11.0)
             .color(TEXT_SECONDARY),
@@ -2442,8 +2442,8 @@ impl TtsApp {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(language.text(
-                "需要联网；文本会发送至 Microsoft Edge 朗读服务进行语音合成。",
-                "Internet required. Text is sent to Microsoft Edge Read Aloud for synthesis.",
+                "仅供个人学习与非商业研究，禁止商业使用；文本会发送至 Microsoft Edge 朗读服务。",
+                "Personal learning and noncommercial research only; text is sent to Microsoft Edge Read Aloud.",
             ))
             .size(11.0)
             .color(TEXT_SECONDARY),

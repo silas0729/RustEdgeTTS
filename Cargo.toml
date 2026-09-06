@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A cross-platform Edge TTS and local Whisper subtitle studio"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 directories = "6.0"
@@ -47,3 +48,9 @@ category = "public.app-category.utilities"
 short_description = "Generate MP3 speech and local AI subtitles"
 osx_minimum_system_version = "12.0"
 icon = ["assets/AppIcon.icns", "assets/AppIcon.svg"]
+resources = [
+    "LICENSE.md",
+    "LICENSE.zh-CN.md",
+    "COMMERCIAL_LICENSE.md",
+    "SERVICE_AND_VOICE_NOTICE.md",
+]

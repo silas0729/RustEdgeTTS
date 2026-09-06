@@ -151,3 +151,22 @@ recognition errors or hallucinate text, so important subtitles should be
 proofread before publication. Whisper Large-v3 Turbo and its model
 configuration are MIT-licensed; model files are downloaded from their
 Hugging Face repositories rather than redistributed inside this app.
+
+## License and commercial use
+
+This project is **source-available, not OSI open source**. Project-authored code
+is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md). It is intended for personal
+learning, experiments, and noncommercial research. Commercial use—including
+business operations, client work, paid content, monetized media, hosted
+services, SaaS/API access, advertising, or indirect commercial benefit—is not
+granted by the public license.
+
+See the [Chinese license summary](LICENSE.zh-CN.md),
+[commercial licensing policy](COMMERCIAL_LICENSE.md), and
+[service and voice notice](SERVICE_AND_VOICE_NOTICE.md). A separately signed
+commercial source-code license, if offered, cannot grant Microsoft Edge Read
+Aloud voice, service, trademark, endpoint, or generated-audio rights. Those
+permissions must be obtained independently from Microsoft and any other
+applicable rights holders, or the integration must be replaced with a properly
+licensed commercial TTS provider.
