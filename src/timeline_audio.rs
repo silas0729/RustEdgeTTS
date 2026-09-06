@@ -143,18 +143,6 @@ pub fn milliseconds_to_samples(milliseconds: u64) -> u64 {
     milliseconds.saturating_mul(u64::from(TIMELINE_SAMPLE_RATE)) / 1_000
 }
 
-pub fn fade_out_for_truncation(samples: &mut [f32]) {
-    let fade_samples = (TIMELINE_SAMPLE_RATE as usize * 35 / 1_000).min(samples.len());
-    if fade_samples == 0 {
-        return;
-    }
-    let start = samples.len() - fade_samples;
-    for (index, sample) in samples[start..].iter_mut().enumerate() {
-        let gain = 1.0 - (index + 1) as f32 / fade_samples as f32;
-        *sample *= gain;
-    }
-}
-
 pub struct TimelineMp3Encoder {
     encoder: Mp3Encoder,
     output: Vec<u8>,
@@ -259,11 +247,20 @@ mod tests {
     }
 
     #[test]
-    fn fades_a_truncated_clip_to_zero() {
-        let mut samples = vec![1.0; 2_000];
-        fade_out_for_truncation(&mut samples);
-        assert_eq!(samples[0], 1.0);
-        assert!(samples.last().unwrap().abs() < f32::EPSILON);
+    fn an_overlong_cue_is_kept_and_delays_the_next_cue() {
+        let mut encoder = TimelineMp3Encoder::new();
+        let two_seconds = vec![0.1_f32; TIMELINE_SAMPLE_RATE as usize * 2];
+        let one_second = vec![0.1_f32; TIMELINE_SAMPLE_RATE as usize];
+
+        encoder.write_clip(&two_seconds).unwrap();
+        // The next authored start is already behind the completed speech, so
+        // no samples are removed and no overlap is introduced.
+        encoder
+            .write_silence_until(u64::from(TIMELINE_SAMPLE_RATE))
+            .unwrap();
+        encoder.write_clip(&one_second).unwrap();
+
+        assert_eq!(encoder.written_samples, u64::from(TIMELINE_SAMPLE_RATE) * 3);
     }
 
     #[test]

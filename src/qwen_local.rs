@@ -199,6 +199,29 @@ impl QwenVoice {
     }
 }
 
+/// The language token is chosen once for an entire preview, article, or
+/// subtitle track. Keeping it fixed prevents the same preset speaker from
+/// changing accent/timbre when adjacent cues alternate between Chinese and
+/// English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QwenSynthesisLanguage {
+    Chinese,
+    English,
+    Japanese,
+    Korean,
+}
+
+impl QwenSynthesisLanguage {
+    fn engine_language(self) -> Language {
+        match self {
+            Self::Chinese => Language::Chinese,
+            Self::English => Language::English,
+            Self::Japanese => Language::Japanese,
+            Self::Korean => Language::Korean,
+        }
+    }
+}
+
 pub struct LocalQwenModel {
     model: Qwen3TTS,
     version: QwenModelVersion,
@@ -243,18 +266,56 @@ impl LocalQwenModel {
         &self.device_label
     }
 
-    pub fn synthesize(&self, text: &str, voice: QwenVoice) -> Result<AudioBuffer, String> {
-        let language = detect_language(text, voice);
-        let options = SynthesisOptions {
-            // 2048 frames is about 2m40s at 12.5 Hz. Long input is split by the
-            // caller, so this is a generous per-segment safety ceiling.
-            max_length: 2048,
+    pub fn synthesize(
+        &self,
+        text: &str,
+        voice: QwenVoice,
+        language: QwenSynthesisLanguage,
+    ) -> Result<AudioBuffer, String> {
+        let mut options = SynthesisOptions {
+            // The upstream 2048-frame default allocates a very large KV cache
+            // even for a five-second subtitle. Size the cache to the actual text
+            // so sequential cues do not exhaust Apple unified/Metal memory.
+            max_length: synthesis_frame_budget(text),
+            // A stable seed keeps sampling/prosody consistent across separately
+            // synthesized subtitle cues while the preset speaker stays fixed.
+            seed: Some(42),
             ..SynthesisOptions::default()
         };
-        self.model
-            .synthesize_with_voice(text, voice.speaker(), language, Some(options))
-            .map_err(|error| format!("Qwen3-TTS 本地合成失败：{error:#}"))
+        let first_attempt = self.model.synthesize_with_voice(
+            text,
+            voice.speaker(),
+            language.engine_language(),
+            Some(options.clone()),
+        );
+        match first_attempt {
+            Ok(audio) => Ok(audio),
+            Err(error) if is_metal_buffer_error(&format!("{error:#}")) => {
+                // A failed large allocation does not make the loaded model
+                // unusable. Retry once with the smallest still-practical cache;
+                // the normal estimate includes roughly 2x duration headroom.
+                options.max_length = (options.max_length / 2).max(128);
+                self.model
+                    .synthesize_with_voice(
+                        text,
+                        voice.speaker(),
+                        language.engine_language(),
+                        Some(options),
+                    )
+                    .map_err(|retry_error| {
+                        format!(
+                            "Qwen3-TTS 本地合成失败：Apple Metal 内存不足，缩小缓存重试后仍失败。请关闭占用内存较大的程序，或改用 Qwen 0.6B 后重试。详情：{retry_error:#}"
+                        )
+                    })
+            }
+            Err(error) => Err(format!("Qwen3-TTS 本地合成失败：{error:#}")),
+        }
     }
+}
+
+fn is_metal_buffer_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("metal") && error.contains("buffer")
 }
 
 struct ModelFile {
@@ -748,18 +809,71 @@ fn valid_file(path: &Path, minimum_size: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn detect_language(text: &str, voice: QwenVoice) -> Language {
-    if text.chars().any(is_japanese_kana) {
-        Language::Japanese
-    } else if text.chars().any(is_hangul) {
-        Language::Korean
-    } else if text.chars().any(is_han) {
-        // Qwen handles Chinese sentences containing English words best when the
-        // language token remains Chinese instead of switching per word.
-        Language::Chinese
-    } else {
-        voice.default_language()
+pub fn synthesis_language<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    voice: QwenVoice,
+) -> QwenSynthesisLanguage {
+    let mut has_han = false;
+    let mut has_kana = false;
+    let mut has_hangul = false;
+    let mut has_latin = false;
+
+    for character in texts.into_iter().flat_map(str::chars) {
+        has_han |= is_han(character);
+        has_kana |= is_japanese_kana(character);
+        has_hangul |= is_hangul(character);
+        has_latin |= character.is_ascii_alphabetic();
     }
+
+    // Kana/Hangul identify Japanese and Korean more specifically because both
+    // languages may also contain Han characters. A track containing any Han
+    // text is treated as Chinese for every cue, including its English-only
+    // cues. A Latin-only track is always English regardless of speaker origin.
+    if has_kana {
+        QwenSynthesisLanguage::Japanese
+    } else if has_hangul {
+        QwenSynthesisLanguage::Korean
+    } else if has_han {
+        QwenSynthesisLanguage::Chinese
+    } else if has_latin {
+        QwenSynthesisLanguage::English
+    } else {
+        match voice.default_language() {
+            Language::Japanese => QwenSynthesisLanguage::Japanese,
+            Language::Korean => QwenSynthesisLanguage::Korean,
+            Language::English => QwenSynthesisLanguage::English,
+            _ => QwenSynthesisLanguage::Chinese,
+        }
+    }
+}
+
+fn synthesis_frame_budget(text: &str) -> usize {
+    let cjk_characters = text
+        .chars()
+        .filter(|character| {
+            is_han(*character) || is_japanese_kana(*character) || is_hangul(*character)
+        })
+        .count();
+    let latin_words = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .count();
+    let punctuation = text
+        .chars()
+        .filter(|character| {
+            character.is_ascii_punctuation() || "，。！？；：、…".contains(*character)
+        })
+        .count();
+
+    // Codec frames are roughly 80 ms. These deliberately conservative factors
+    // allow substantially slower-than-normal speech while avoiding the fixed
+    // 2048-frame allocation. Long article input is split by the caller.
+    cjk_characters
+        .saturating_mul(5)
+        .saturating_add(latin_words.saturating_mul(10))
+        .saturating_add(punctuation.saturating_mul(2))
+        .saturating_add(64)
+        .clamp(128, 1_024)
 }
 
 fn is_han(character: char) -> bool {
@@ -808,23 +922,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mixed_chinese_and_english_uses_chinese_language_token() {
+    fn mixed_chinese_and_english_track_uses_one_chinese_language_token() {
         assert_eq!(
-            detect_language("欢迎使用 Qwen3 TTS studio", QwenVoice::Ryan),
-            Language::Chinese
+            synthesis_language(
+                ["欢迎使用 Qwen3 TTS studio", "Hello from the next cue"],
+                QwenVoice::Ryan,
+            ),
+            QwenSynthesisLanguage::Chinese
         );
     }
 
     #[test]
-    fn speaker_language_is_used_for_latin_only_text() {
+    fn latin_only_track_stays_english_even_with_a_japanese_voice() {
         assert_eq!(
-            detect_language("Hello from Qwen", QwenVoice::Ryan),
-            Language::English
+            synthesis_language(["Hello from Qwen"], QwenVoice::OnoAnna),
+            QwenSynthesisLanguage::English
         );
-        assert_eq!(
-            detect_language("Hello from Qwen", QwenVoice::OnoAnna),
-            Language::Japanese
-        );
+    }
+
+    #[test]
+    fn short_subtitles_use_a_bounded_metal_frame_budget() {
+        let short = synthesis_frame_budget("大家好，我是一名独立 iOS 开发者");
+        let long = synthesis_frame_budget(&"中文语音。".repeat(100));
+
+        assert!((128..512).contains(&short));
+        assert_eq!(long, 1_024);
+        assert!(short < SynthesisOptions::default().max_length);
     }
 
     #[test]

@@ -7,7 +7,7 @@ The interface defaults to Chinese, can switch to English, supports bilingual
 voice search, one-click voice previews, speech-rate and volume controls,
 and keeps long documents inside a dedicated scrollable editor. It can also
 import SRT (including `.str`-named files), WebVTT, ASS/SSA, and LRC subtitles and build an MP3 whose silence
-and speech follow the authored cue timings.
+and speech follow the authored cue timings without automatically speeding up or truncating speech.
 
 The Qwen3 local mode lets the user explicitly select either the official
 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` lightweight checkpoint or the
@@ -58,7 +58,7 @@ RustEdgeTTS/
 └── src/
     ├── asr.rs                  # local Whisper inference and SRT/VTT export
     ├── main.rs                 # egui UI and Tokio channel worker
-    ├── qwen_local.rs           # local Qwen3-TTS model and language detection
+    ├── qwen_local.rs           # local Qwen3-TTS model and job-level language lock
     ├── subtitle_pipeline.rs    # asynchronous per-cue TTS orchestration
     ├── subtitles.rs            # SRT/VTT/ASS/SSA/LRC and text encodings
     ├── system_proxy.rs
@@ -115,7 +115,7 @@ Hugging Face into the user's Application Support cache; later runs reuse those
 files and transcribe offline.
 
 Qwen3-TTS is substantially larger than the other dependencies, so the normal
-test suite validates model-version routing, mixed-language detection, long-text
+test suite validates model-version routing, mixed-language job locking, long-text
 segmentation, PCM speed/volume processing, and MP3 encoding without downloading
 both models. A real first-run synthesis is initiated from the app and requires
 enough free disk space and memory for the selected official checkpoint. The
@@ -184,8 +184,13 @@ the large weight download cannot invalidate the first run.
 On macOS, Qwen3-TTS uses Candle's Metal backend. Windows and Linux use its CPU
 backend. The worker releases Qwen before loading Whisper (and vice versa), so
 the two large local models do not occupy memory at the same time. Qwen output is
-resampled in Rust for the selected speed and volume, then encoded as 24 kHz mono
-MP3. In subtitle mode every cue remains anchored to its authored start time.
+resampled in Rust only for the speed explicitly selected by the user, applies
+the selected volume, and is encoded as 24 kHz mono MP3. One language token and
+stable sampling seed are used for a complete Qwen task, so Chinese/English cue
+boundaries do not switch the selected speaker's voice. In subtitle mode every
+cue starts at its authored time when the preceding speech has finished. A cue
+that speaks longer than its slot continues at the selected speed and delays the
+following cue; it is never automatically sped up or truncated.
 
 ## Privacy and service note
 

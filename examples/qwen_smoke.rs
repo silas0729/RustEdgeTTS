@@ -50,26 +50,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
     println!("Loading complete on {}.", model.device_label());
-    let audio = model.synthesize(
-        "你好，这是 Qwen3 本地语音合成测试。Hello from Qwen three.",
-        QwenVoice::Vivian,
-    )?;
-    if audio.samples.is_empty() || audio.sample_rate != 24_000 {
-        return Err("Qwen3-TTS returned invalid audio".into());
+    let sample_segments = [
+        "大家好，我是一名独立 iOS 开发者。",
+        "项目的完整代码已经上传到 GitHub。",
+        "这款工具基于 iOS Packet Tunnel。",
+        "Thanks for watching and welcome to star the project.",
+    ];
+    let voice = QwenVoice::Vivian;
+    let language = qwen_local::synthesis_language(sample_segments, voice);
+    let mut encoder = timeline_audio::TimelineMp3Encoder::new();
+    for (index, sample_text) in sample_segments.iter().enumerate() {
+        println!("Synthesizing consistency segment {}/4…", index + 1);
+        let audio = model.synthesize(sample_text, voice, language)?;
+        if audio.samples.is_empty() || audio.sample_rate != 24_000 {
+            return Err("Qwen3-TTS returned invalid audio".into());
+        }
+        encoder.write_clip(&audio.samples)?;
     }
-
-    let samples = if audio.sample_rate == timeline_audio::TIMELINE_SAMPLE_RATE {
-        audio.samples
-    } else {
-        timeline_audio::resample_linear(
-            &audio.samples,
-            audio.sample_rate,
-            timeline_audio::TIMELINE_SAMPLE_RATE,
-        )
-    };
-    let mut samples = timeline_audio::adjust_speed(&samples, 10);
-    timeline_audio::apply_volume(&mut samples, 5);
-    let mp3 = timeline_audio::encode_mono_mp3(&samples)?;
+    let mp3 = encoder.finish()?;
     let decoded = timeline_audio::decode_mp3_mono_preserving_silence(&mp3)?;
     if decoded.is_empty() {
         return Err("the generated Qwen3 MP3 could not be decoded".into());

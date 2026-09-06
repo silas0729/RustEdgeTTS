@@ -68,11 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = std::env::temp_dir().join("edge-tts-subtitle-smoke.mp3");
     tokio::fs::write(&output_path, &report.mp3).await?;
     println!(
-        "Subtitle timeline passed: {} bytes, duration {}, adjusted {}, truncated {}, output {}",
+        "Subtitle timeline passed: {} bytes, duration {}, overflowed {}, output {}",
         report.mp3.len(),
         format_timestamp(duration_ms),
-        report.adjusted_count,
-        report.truncated_count,
+        report.overflow_count,
         output_path.display()
     );
     Ok(())

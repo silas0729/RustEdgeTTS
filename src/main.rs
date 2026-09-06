@@ -21,7 +21,7 @@ mod system_proxy;
 mod timeline_audio;
 
 use asr::{RecognitionLanguage, SubtitleExportFormat};
-use qwen_local::{LocalQwenModel, QwenModelVersion, QwenVoice};
+use qwen_local::{LocalQwenModel, QwenModelVersion, QwenSynthesisLanguage, QwenVoice};
 use subtitles::{SubtitleCue, SubtitleTrack, format_timestamp, parse_subtitle};
 
 const APP_NAME: &str = "Edge TTS Studio";
@@ -141,8 +141,7 @@ enum WorkerEvent {
     SubtitleGenerationFinished {
         output_path: PathBuf,
         byte_count: usize,
-        adjusted_count: usize,
-        truncated_count: usize,
+        overflow_count: usize,
     },
     AsrModelProgress {
         source: String,
@@ -878,29 +877,44 @@ impl TtsApp {
                 WorkerEvent::SubtitleGenerationFinished {
                     output_path,
                     byte_count,
-                    adjusted_count,
-                    truncated_count,
+                    overflow_count,
                 } => {
                     self.generating = false;
                     self.subtitle_progress = None;
                     self.last_generated_audio = Some(output_path.clone());
-                    let kind = if truncated_count > 0 {
+                    let kind = if overflow_count > 0 {
                         StatusKind::Warning
                     } else {
                         StatusKind::Success
                     };
                     self.status = Some(StatusMessage::new(
                         kind,
-                        format!(
-                            "字幕音频已保存（{:.1} KB）；自动调速 {adjusted_count} 条，截断 {truncated_count} 条：{}",
-                            byte_count as f64 / 1024.0,
-                            output_path.display()
-                        ),
-                        format!(
-                            "Saved subtitle audio ({:.1} KB); {adjusted_count} cues auto-fitted and {truncated_count} truncated: {}",
-                            byte_count as f64 / 1024.0,
-                            output_path.display()
-                        ),
+                        if overflow_count > 0 {
+                            format!(
+                                "字幕音频已保存（{:.1} KB）；保持所选语速，未自动调速或截断，{overflow_count} 条超出原时段并顺延：{}",
+                                byte_count as f64 / 1024.0,
+                                output_path.display()
+                            )
+                        } else {
+                            format!(
+                                "字幕音频已保存（{:.1} KB）；保持所选语速，未自动调速或截断：{}",
+                                byte_count as f64 / 1024.0,
+                                output_path.display()
+                            )
+                        },
+                        if overflow_count > 0 {
+                            format!(
+                                "Saved subtitle audio ({:.1} KB); selected speed preserved, no auto-fit or truncation; {overflow_count} cues extended beyond their slots: {}",
+                                byte_count as f64 / 1024.0,
+                                output_path.display()
+                            )
+                        } else {
+                            format!(
+                                "Saved subtitle audio ({:.1} KB); selected speed preserved with no auto-fit or truncation: {}",
+                                byte_count as f64 / 1024.0,
+                                output_path.display()
+                            )
+                        },
                     ));
                 }
                 WorkerEvent::AsrModelProgress {
@@ -3853,10 +3867,11 @@ fn synthesize_qwen_pcm(
     model: &LocalQwenModel,
     text: &str,
     voice: QwenVoice,
+    language: QwenSynthesisLanguage,
     rate_percent: i32,
     volume_percent: i32,
 ) -> Result<Vec<f32>, String> {
-    let audio = model.synthesize(text, voice)?;
+    let audio = model.synthesize(text, voice, language)?;
     if audio.samples.is_empty() {
         return Err("Qwen3-TTS 没有生成可用的音频采样。".to_owned());
     }
@@ -3889,14 +3904,21 @@ async fn preview_qwen_voice(
             return;
         }
     };
-    let samples =
-        match synthesize_qwen_pcm(model, &text, selection.voice, rate_percent, volume_percent) {
-            Ok(samples) => samples,
-            Err(error) => {
-                let _ = event_tx.send(WorkerEvent::PreviewFailed(error));
-                return;
-            }
-        };
+    let language = qwen_local::synthesis_language([text.as_str()], selection.voice);
+    let samples = match synthesize_qwen_pcm(
+        model,
+        &text,
+        selection.voice,
+        language,
+        rate_percent,
+        volume_percent,
+    ) {
+        Ok(samples) => samples,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::PreviewFailed(error));
+            return;
+        }
+    };
     match timeline_audio::encode_mono_mp3(&samples) {
         Ok(mp3) => play_preview_mp3(event_tx, mp3).await,
         Err(error) => {
@@ -3932,6 +3954,7 @@ async fn generate_qwen_mp3(
     }
 
     let total = chunks.len();
+    let language = qwen_local::synthesis_language([text.as_str()], selection.voice);
     let gap = vec![0.0_f32; timeline_audio::TIMELINE_SAMPLE_RATE as usize * 90 / 1_000];
     let mut encoder = timeline_audio::TimelineMp3Encoder::new();
     for (index, chunk) in chunks.iter().enumerate() {
@@ -3941,6 +3964,7 @@ async fn generate_qwen_mp3(
             model,
             chunk,
             selection.voice,
+            language,
             rate_percent,
             volume_percent,
         ) {
@@ -4011,10 +4035,11 @@ async fn generate_qwen_subtitle_mp3(
     };
 
     let total = cues.len();
+    let language =
+        qwen_local::synthesis_language(cues.iter().map(|cue| cue.text.as_str()), selection.voice);
     let timeline_end_ms = cues.iter().map(|cue| cue.end_ms).max().unwrap_or(0);
     let mut encoder = timeline_audio::TimelineMp3Encoder::new();
-    let mut adjusted_count = 0;
-    let mut truncated_count = 0;
+    let mut overflow_count = 0;
 
     for (index, cue) in cues.iter().enumerate() {
         let current = index + 1;
@@ -4033,10 +4058,11 @@ async fn generate_qwen_subtitle_mp3(
         let available_samples =
             timeline_audio::milliseconds_to_samples(cue_slot_end_ms.saturating_sub(cue.start_ms))
                 as usize;
-        let mut clip = match synthesize_qwen_pcm(
+        let clip = match synthesize_qwen_pcm(
             model,
             &cue.text,
             selection.voice,
+            language,
             rate_percent,
             volume_percent,
         ) {
@@ -4050,17 +4076,11 @@ async fn generate_qwen_subtitle_mp3(
         };
 
         if clip.len() > available_samples {
-            // Local playback-rate fitting is capped at 2x so an extremely short
-            // subtitle slot cannot turn speech into unintelligible noise.
-            let fastest_len = clip.len().div_ceil(2);
-            let target_len = available_samples.max(fastest_len);
-            clip = timeline_audio::resample_to_len(&clip, target_len);
-            adjusted_count += 1;
-        }
-        if clip.len() > available_samples {
-            clip.truncate(available_samples);
-            timeline_audio::fade_out_for_truncation(&mut clip);
-            truncated_count += 1;
+            // Never alter pitch or drop spoken words to force a cue into a short
+            // subtitle slot. The next cue remains anchored when possible; if
+            // this clip runs long, TimelineMp3Encoder naturally starts it after
+            // the preceding speech instead of overlapping or truncating it.
+            overflow_count += 1;
         }
         if let Err(error) = encoder.write_clip(&clip) {
             let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
@@ -4087,8 +4107,7 @@ async fn generate_qwen_subtitle_mp3(
             let _ = event_tx.send(WorkerEvent::SubtitleGenerationFinished {
                 output_path,
                 byte_count,
-                adjusted_count,
-                truncated_count,
+                overflow_count,
             });
         }
         Err(error) => {
@@ -4231,8 +4250,7 @@ async fn generate_subtitle_mp3(
             let _ = event_tx.send(WorkerEvent::SubtitleGenerationFinished {
                 output_path,
                 byte_count,
-                adjusted_count: report.adjusted_count,
-                truncated_count: report.truncated_count,
+                overflow_count: report.overflow_count,
             });
         }
         Err(error) => {
