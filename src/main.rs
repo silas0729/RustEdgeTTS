@@ -472,7 +472,10 @@ impl TtsApp {
             event_rx,
             voices: Vec::new(),
             selected_voice: None,
-            voice_filter: String::new(),
+            // The Chinese interface starts with the focused Chinese catalogue
+            // shown in the preferred default layout. Clearing the field still
+            // reveals every Edge voice.
+            voice_filter: "中文".to_owned(),
             text: DEFAULT_TEXT.to_owned(),
             workspace_mode: WorkspaceMode::TextToSpeech,
             input_mode: InputMode::Text,
@@ -1174,14 +1177,27 @@ impl eframe::App for TtsApp {
                             WorkspaceMode::TextToSpeech => 98.0,
                             WorkspaceMode::AudioToSubtitles => 118.0,
                         };
-                        let workspace_height = (ui.available_height() - footer_height).max(320.0);
+                        let visible_height = (ui.clip_rect().bottom() - ui.cursor().min.y).max(0.0);
+                        let workspace_height = (visible_height - footer_height).max(280.0);
                         let gap = 14.0;
-                        let total_width = ui.available_width();
+                        let visible_width = (ui.clip_rect().right() - ui.cursor().min.x).max(0.0);
+                        let total_width = ui.available_width().min(visible_width);
+                        let (workspace_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(total_width, workspace_height),
+                            egui::Sense::hover(),
+                        );
+                        let mut workspace_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt("fixed-workspace")
+                                .max_rect(workspace_rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        workspace_ui.set_clip_rect(workspace_rect.intersect(ui.clip_rect()));
                         match self.workspace_mode {
                             WorkspaceMode::TextToSpeech => {
                                 let voice_width = (total_width * 0.39).clamp(360.0, 420.0);
                                 let text_width = (total_width - voice_width - gap).max(420.0);
-                                ui.horizontal_top(|ui| {
+                                workspace_ui.horizontal_top(|ui| {
                                     ui.spacing_mut().item_spacing.x = gap;
                                     ui.allocate_ui_with_layout(
                                         egui::vec2(voice_width, workspace_height),
@@ -1194,13 +1210,21 @@ impl eframe::App for TtsApp {
                                         |ui| self.show_text_card(ui, language, workspace_height),
                                     );
                                 });
-                                ui.add_space(14.0);
-                                self.show_generate_area(ui, language);
                             }
                             WorkspaceMode::AudioToSubtitles => {
-                                self.show_asr_workspace(ui, language, workspace_height, gap);
-                                ui.add_space(14.0);
-                                self.show_transcription_area(ui, language);
+                                self.show_asr_workspace(
+                                    &mut workspace_ui,
+                                    language,
+                                    workspace_height,
+                                    gap,
+                                );
+                            }
+                        }
+                        ui.add_space(14.0);
+                        match self.workspace_mode {
+                            WorkspaceMode::TextToSpeech => self.show_generate_area(ui, language),
+                            WorkspaceMode::AudioToSubtitles => {
+                                self.show_transcription_area(ui, language)
                             }
                         }
                     });
@@ -1357,10 +1381,13 @@ impl TtsApp {
                 });
             });
 
-            ui.add_space(14.0);
+            ui.add_space(10.0);
             ui.add_enabled_ui(!busy, |ui| {
                 input_frame().show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        let row_width = ui.available_width();
+                        let has_clear = !self.voice_filter.is_empty();
+                        let clear_slot = if has_clear { 54.0 } else { 0.0 };
                         let (search_rect, _) =
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
                         let painter = ui.painter();
@@ -1380,11 +1407,11 @@ impl TtsApp {
                                     "搜索音色，如：晓晓、英语、en-US",
                                     "Search voices, e.g. Xiaoxiao, English, en-US",
                                 ))
-                                .desired_width(f32::INFINITY)
+                                .desired_width((row_width - 34.0 - clear_slot).max(80.0))
                                 .frame(egui::Frame::NONE)
                                 .text_color(TEXT_PRIMARY),
                         );
-                        if !self.voice_filter.is_empty()
+                        if has_clear
                             && ui
                                 .add(
                                     egui::Button::new(
@@ -1394,7 +1421,8 @@ impl TtsApp {
                                     )
                                     .fill(egui::Color32::TRANSPARENT)
                                     .stroke(egui::Stroke::NONE)
-                                    .corner_radius(7),
+                                    .corner_radius(7)
+                                    .min_size(egui::vec2(46.0, 26.0)),
                                 )
                                 .on_hover_text(language.text("清除搜索", "Clear search"))
                                 .clicked()
@@ -1458,7 +1486,7 @@ impl TtsApp {
                     .color(TEXT_SECONDARY),
             );
 
-            ui.add_space(12.0);
+            ui.add_space(8.0);
             egui::Frame::new()
                 .fill(EDITOR_BACKGROUND)
                 .stroke(egui::Stroke::new(1.0, BORDER))
@@ -1504,8 +1532,7 @@ impl TtsApp {
                     );
                 });
 
-            ui.add_space(12.0);
-            let preview_panel_height = ui.available_height().max(112.0);
+            ui.add_space(8.0);
             egui::Frame::new()
                 .fill(PRIMARY_SOFT)
                 .stroke(egui::Stroke::new(
@@ -1513,9 +1540,8 @@ impl TtsApp {
                     egui::Color32::from_rgb(213, 220, 255),
                 ))
                 .corner_radius(11)
-                .inner_margin(egui::Margin::same(10))
+                .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
-                    ui.set_min_height((preview_panel_height - 20.0).max(0.0));
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(language.text("试听音色", "Voice preview"))
@@ -1533,15 +1559,14 @@ impl TtsApp {
                             );
                         });
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
 
-                    let waveform_height = (ui.available_height() - 44.0).clamp(24.0, 40.0);
                     let (waveform_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), waveform_height),
+                        egui::vec2(ui.available_width(), 22.0),
                         egui::Sense::hover(),
                     );
                     paint_preview_waveform(ui, waveform_rect, self.previewing);
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
 
                     let can_preview = !busy && self.selected_voice.is_some();
                     let preview_label = if self.previewing {
@@ -1687,7 +1712,7 @@ impl TtsApp {
         });
 
         ui.add_space(7.0);
-        let editor_height = ui.available_height().max(190.0);
+        let editor_height = (ui.available_height() - 16.0).max(96.0);
         egui::Frame::new()
             .fill(EDITOR_BACKGROUND)
             .stroke(egui::Stroke::new(1.0, BORDER))
@@ -1838,7 +1863,7 @@ impl TtsApp {
         }
 
         ui.add_space(8.0);
-        let list_height = ui.available_height().max(150.0);
+        let list_height = (ui.available_height() - 14.0).max(96.0);
         let track = self
             .subtitle_track
             .as_ref()
@@ -3267,8 +3292,11 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            .with_inner_size([1100.0, 820.0])
             .with_min_inner_size([960.0, 720.0]),
+        // Do not let a previously persisted compact window override the
+        // intended full-height startup layout.
+        persist_window: false,
         ..Default::default()
     };
 
