@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::{
     path::{Path, PathBuf},
     thread,
@@ -442,7 +444,7 @@ struct TtsApp {
 
 impl TtsApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        configure_egui_for_macos(&creation_context.egui_ctx);
+        configure_egui_for_platform(&creation_context.egui_ctx);
 
         let (command_tx, event_rx, startup_error) = spawn_tts_worker();
         let fetching_voices = startup_error.is_none();
@@ -2916,11 +2918,49 @@ async fn preview_voice(
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let playback_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let samples = timeline_audio::decode_mp3_mono_preserving_silence(&result.audio)
+                .map_err(|error| format!("Could not decode the preview audio: {error}"))?;
+            if samples.is_empty() {
+                return Err("The preview audio did not contain any samples.".to_owned());
+            }
+
+            let (_stream, stream_handle) = rodio::OutputStream::try_default()
+                .map_err(|error| format!("Could not open the Windows audio device: {error}"))?;
+            let sink = rodio::Sink::try_new(&stream_handle)
+                .map_err(|error| format!("Could not create the Windows audio player: {error}"))?;
+            sink.append(rodio::buffer::SamplesBuffer::new(
+                1,
+                timeline_audio::TIMELINE_SAMPLE_RATE,
+                samples,
+            ));
+            sink.sleep_until_end();
+            Ok(())
+        })
+        .await;
+
+        match playback_result {
+            Ok(Ok(())) => {
+                let _ = event_tx.send(WorkerEvent::PreviewFinished);
+            }
+            Ok(Err(error)) => {
+                let _ = event_tx.send(WorkerEvent::PreviewFailed(error));
+            }
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::PreviewFailed(format!(
+                    "The Windows audio playback task failed: {error}"
+                )));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = result;
         let _ = event_tx.send(WorkerEvent::PreviewFailed(
-            "Voice preview playback is currently available on macOS.".to_owned(),
+            "Voice preview playback is currently available on macOS and Windows.".to_owned(),
         ));
     }
 }
@@ -3239,7 +3279,7 @@ fn localized_transcription_error(error: &str) -> String {
     }
 }
 
-fn configure_egui_for_macos(ctx: &egui::Context) {
+fn configure_egui_for_platform(ctx: &egui::Context) {
     // The interface uses a deliberate light palette so the custom card and
     // status colors stay legible and consistent across macOS appearances.
     ctx.set_theme(egui::Theme::Light);
@@ -3260,37 +3300,61 @@ fn configure_egui_for_macos(ctx: &egui::Context) {
         ctx.set_style_of(theme, style);
     }
 
-    // egui's compact default font set does not include CJK glyphs. On macOS,
-    // add a system Chinese font as a fallback so pasted Chinese text renders.
+    // egui's compact default font set does not include CJK glyphs. Load a
+    // native fallback on each desktop OS so the Chinese-first UI is readable.
+    let mut font_candidates = Vec::<PathBuf>::new();
     #[cfg(target_os = "macos")]
-    {
-        const FONT_CANDIDATES: &[&str] = &[
+    font_candidates.extend(
+        [
             "/System/Library/Fonts/PingFang.ttc",
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
             "/System/Library/Fonts/STHeiti Medium.ttc",
-        ];
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+    #[cfg(target_os = "windows")]
+    {
+        let windows_dir = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        font_candidates.extend(
+            ["msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"]
+                .into_iter()
+                .map(|name| windows_dir.join("Fonts").join(name)),
+        );
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    font_candidates.extend(
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
 
-        if let Some(font_bytes) = FONT_CANDIDATES
-            .iter()
-            .find_map(|path| std::fs::read(path).ok())
-        {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "macos-cjk".to_owned(),
-                egui::FontData::from_owned(font_bytes).into(),
-            );
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("macos-cjk".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("macos-cjk".to_owned());
-            ctx.set_fonts(fonts);
-        }
+    if let Some(font_bytes) = font_candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+    {
+        let fallback_name = "system-cjk".to_owned();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            fallback_name.clone(),
+            egui::FontData::from_owned(font_bytes).into(),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push(fallback_name.clone());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push(fallback_name);
+        ctx.set_fonts(fonts);
     }
 }
 

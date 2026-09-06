@@ -1,9 +1,9 @@
 # Edge TTS Studio
 
-A lightweight Rust desktop GUI for macOS. It fetches Microsoft Edge Read Aloud
+A lightweight Rust desktop GUI for macOS and Windows. It fetches Microsoft Edge Read Aloud
 voices, accepts multiline text, and writes synthesized speech to an MP3 file.
 The interface defaults to Chinese, can switch to English, supports bilingual
-voice search, one-click macOS voice previews, speech-rate and volume controls,
+voice search, one-click voice previews, speech-rate and volume controls,
 and keeps long documents inside a dedicated scrollable editor. It can also
 import SRT (including `.str`-named files), WebVTT, ASS/SSA, and LRC subtitles and build an MP3 whose silence
 and speech follow the authored cue timings.
@@ -83,15 +83,33 @@ passed explicitly. Its first run downloads about 478 MB of model data from
 Hugging Face into the user's Application Support cache; later runs reuse those
 files and transcribe offline.
 
-## Optional `.app` bundle
+## Build the macOS app and installer image
 
 ```bash
 cargo install cargo-bundle
-cargo bundle --release
-open "target/release/bundle/osx/Edge TTS Studio.app"
+./scripts/package_macos.sh
 ```
 
-`cargo-bundle` is only packaging tooling; it is not needed for development.
+Open `target/release/bundle/dmg/Edge TTS Studio.dmg`, then drag the app onto the
+`Applications` shortcut. A macOS app does not run a traditional installer; the
+copy into `/Applications` is the installation step. The local package uses an
+ad-hoc signature. Public distribution additionally requires a paid Developer ID
+certificate and Apple notarization.
+
+## Build on Windows
+
+Install the stable Rust MSVC toolchain and Visual Studio Build Tools with the
+"Desktop development with C++" workload, then run in PowerShell:
+
+```powershell
+cargo build --release --locked
+```
+
+The portable program is written to
+`target\release\edge-tts-studio.exe`. Windows uses CPU inference for the local
+Whisper model; macOS continues to use Metal acceleration. A distributable
+installer and SmartScreen reputation require separate Windows packaging and
+code signing.
 
 ## Architecture
 
