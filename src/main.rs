@@ -21,7 +21,10 @@ mod system_proxy;
 mod timeline_audio;
 
 use asr::{RecognitionLanguage, SubtitleExportFormat};
-use qwen_local::{LocalQwenModel, QwenModelVersion, QwenSynthesisLanguage, QwenVoice};
+use qwen_local::{
+    LocalQwenModel, LocalVoiceClonePrompt, QwenModelKind, QwenModelVersion, QwenSynthesisLanguage,
+    QwenVoice,
+};
 use subtitles::{SubtitleCue, SubtitleTrack, format_timestamp, parse_subtitle};
 
 const APP_NAME: &str = "Edge TTS Studio";
@@ -77,6 +80,7 @@ enum WorkerCommand {
     },
     ImportQwenModel {
         version: QwenModelVersion,
+        kind: QwenModelKind,
         source_dir: PathBuf,
     },
     TranscribeMp3 {
@@ -97,33 +101,41 @@ enum WorkerEvent {
     VoicesFailed(String),
     QwenModelPreparing {
         version: QwenModelVersion,
+        kind: QwenModelKind,
     },
     QwenModelDownload {
         version: QwenModelVersion,
+        kind: QwenModelKind,
         file: String,
         downloaded_bytes: u64,
         total_bytes: u64,
     },
     QwenModelReady {
         version: QwenModelVersion,
+        kind: QwenModelKind,
         device: String,
     },
     QwenModelImportProgress {
         version: QwenModelVersion,
+        kind: QwenModelKind,
         file: String,
         copied_bytes: u64,
         total_bytes: u64,
     },
     QwenModelImported {
         version: QwenModelVersion,
+        kind: QwenModelKind,
         device: String,
         model_dir: PathBuf,
     },
     QwenModelImportFailed {
         version: QwenModelVersion,
+        kind: QwenModelKind,
         error: String,
     },
     QwenModelReleased,
+    QwenClonePromptPreparing,
+    QwenClonePromptReady,
     QwenProgress {
         current: usize,
         total: usize,
@@ -175,16 +187,50 @@ enum TtsEngine {
     Qwen3Local,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QwenVoiceMode {
+    Preset,
+    Clone,
+}
+
 #[derive(Clone, Debug)]
 enum VoiceSelection {
     Edge(String),
-    Qwen3(QwenSelection),
+    Qwen3Preset(QwenSelection),
+    Qwen3Clone(QwenCloneSelection),
 }
 
 #[derive(Clone, Copy, Debug)]
 struct QwenSelection {
     version: QwenModelVersion,
     voice: QwenVoice,
+}
+
+#[derive(Clone, Debug)]
+struct QwenCloneSelection {
+    version: QwenModelVersion,
+    reference_path: PathBuf,
+    reference_text: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QwenClonePromptKey {
+    version: QwenModelVersion,
+    reference_path: PathBuf,
+    reference_text: String,
+    file_len: u64,
+    modified_nanos: u128,
+}
+
+struct CachedQwenClonePrompt {
+    key: QwenClonePromptKey,
+    prompt: LocalVoiceClonePrompt,
+}
+
+struct QwenOutputSettings {
+    rate_percent: i32,
+    volume_percent: i32,
+    output_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -522,6 +568,10 @@ struct TtsApp {
     tts_engine: TtsEngine,
     selected_qwen_version: QwenModelVersion,
     selected_qwen_voice: QwenVoice,
+    qwen_voice_mode: QwenVoiceMode,
+    clone_reference_path: Option<PathBuf>,
+    clone_reference_text: String,
+    clone_authorized: bool,
     voice_filter: String,
     text: String,
     workspace_mode: WorkspaceMode,
@@ -534,7 +584,7 @@ struct TtsApp {
     ui_language: UiLanguage,
     fetching_voices: bool,
     qwen_model_preparing: bool,
-    qwen_model_ready: Option<QwenModelVersion>,
+    qwen_model_ready: Option<(QwenModelVersion, QwenModelKind)>,
     qwen_device: Option<String>,
     qwen_manual_help_open: bool,
     previewing: bool,
@@ -587,6 +637,10 @@ impl TtsApp {
             tts_engine: TtsEngine::Edge,
             selected_qwen_version: QwenModelVersion::DEFAULT,
             selected_qwen_voice: QwenVoice::Vivian,
+            qwen_voice_mode: QwenVoiceMode::Preset,
+            clone_reference_path: None,
+            clone_reference_text: String::new(),
+            clone_authorized: false,
             // The Chinese interface starts with the focused Chinese catalogue
             // shown in the preferred default layout. Clearing the field still
             // reveals every Edge voice.
@@ -684,25 +738,28 @@ impl TtsApp {
                         error,
                     ));
                 }
-                WorkerEvent::QwenModelPreparing { version } => {
+                WorkerEvent::QwenModelPreparing { version, kind } => {
                     self.qwen_model_preparing = true;
                     self.qwen_model_ready = None;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Info,
                         format!(
-                            "正在准备 Qwen3-TTS {} 本地模型，首次使用需下载约 {}…",
+                            "正在准备 Qwen3-TTS {} {} 本地模型，首次使用需下载约 {}…",
                             version.short_label(),
+                            kind.short_label(),
                             version.download_size_label()
                         ),
                         format!(
-                            "Preparing the local Qwen3-TTS {} model. The first run downloads about {}…",
+                            "Preparing the local Qwen3-TTS {} {} model. The first run downloads about {}…",
                             version.short_label(),
+                            kind.short_label(),
                             version.download_size_label()
                         ),
                     ));
                 }
                 WorkerEvent::QwenModelDownload {
                     version,
+                    kind,
                     file,
                     downloaded_bytes,
                     total_bytes,
@@ -719,35 +776,44 @@ impl TtsApp {
                     self.status = Some(StatusMessage::new(
                         StatusKind::Info,
                         format!(
-                            "正在下载 Qwen3 {} {}：{progress}",
+                            "正在下载 Qwen3 {} {} {}：{progress}",
                             version.short_label(),
+                            kind.short_label(),
                             localized_file.0
                         ),
                         format!(
-                            "Downloading Qwen3 {} {}: {progress}",
+                            "Downloading Qwen3 {} {} {}: {progress}",
                             version.short_label(),
+                            kind.short_label(),
                             localized_file.1
                         ),
                     ));
                 }
-                WorkerEvent::QwenModelReady { version, device } => {
+                WorkerEvent::QwenModelReady {
+                    version,
+                    kind,
+                    device,
+                } => {
                     self.qwen_model_preparing = false;
-                    self.qwen_model_ready = Some(version);
+                    self.qwen_model_ready = Some((version, kind));
                     self.qwen_device = Some(device.clone());
                     self.status = Some(StatusMessage::new(
                         StatusKind::Info,
                         format!(
-                            "Qwen3-TTS {} 已就绪，正在使用 {device} 本地生成…",
-                            version.short_label()
+                            "Qwen3-TTS {} {} 已就绪，正在使用 {device} 本地生成…",
+                            version.short_label(),
+                            kind.short_label()
                         ),
                         format!(
-                            "Qwen3-TTS {} is ready. Generating locally with {device}…",
-                            version.short_label()
+                            "Qwen3-TTS {} {} is ready. Generating locally with {device}…",
+                            version.short_label(),
+                            kind.short_label()
                         ),
                     ));
                 }
                 WorkerEvent::QwenModelImportProgress {
                     version,
+                    kind,
                     file,
                     copied_bytes,
                     total_bytes,
@@ -764,51 +830,65 @@ impl TtsApp {
                     self.status = Some(StatusMessage::new(
                         StatusKind::Info,
                         format!(
-                            "正在导入 Qwen3 {} {}：{progress}",
+                            "正在导入 Qwen3 {} {} {}：{progress}",
                             version.short_label(),
+                            kind.short_label(),
                             localized_file.0
                         ),
                         format!(
-                            "Importing Qwen3 {} {}: {progress}",
+                            "Importing Qwen3 {} {} {}: {progress}",
                             version.short_label(),
+                            kind.short_label(),
                             localized_file.1
                         ),
                     ));
                 }
                 WorkerEvent::QwenModelImported {
                     version,
+                    kind,
                     device,
                     model_dir,
                 } => {
                     self.qwen_model_preparing = false;
-                    self.qwen_model_ready = Some(version);
+                    self.qwen_model_ready = Some((version, kind));
                     self.qwen_device = Some(device.clone());
                     self.qwen_manual_help_open = false;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Success,
                         format!(
-                            "已导入并加载 Qwen3-TTS {}（{device}）：{}",
+                            "已导入并加载 Qwen3-TTS {} {}（{device}）：{}",
                             version.short_label(),
+                            kind.short_label(),
                             model_dir.display()
                         ),
                         format!(
-                            "Imported and loaded Qwen3-TTS {} on {device}: {}",
+                            "Imported and loaded Qwen3-TTS {} {} on {device}: {}",
                             version.short_label(),
+                            kind.short_label(),
                             model_dir.display()
                         ),
                     ));
                 }
-                WorkerEvent::QwenModelImportFailed { version, error } => {
+                WorkerEvent::QwenModelImportFailed {
+                    version,
+                    kind,
+                    error,
+                } => {
                     self.qwen_model_preparing = false;
                     self.qwen_model_ready = None;
                     self.qwen_device = None;
                     self.qwen_manual_help_open = true;
                     self.status = Some(StatusMessage::new(
                         StatusKind::Error,
-                        format!("Qwen3 {} 离线模型导入失败：{error}", version.short_label()),
                         format!(
-                            "Could not import the Qwen3 {} offline model: {error}",
-                            version.short_label()
+                            "Qwen3 {} {} 离线模型导入失败：{error}",
+                            version.short_label(),
+                            kind.short_label()
+                        ),
+                        format!(
+                            "Could not import the Qwen3 {} {} offline model: {error}",
+                            version.short_label(),
+                            kind.short_label()
                         ),
                     ));
                 }
@@ -816,6 +896,20 @@ impl TtsApp {
                     self.qwen_model_preparing = false;
                     self.qwen_model_ready = None;
                     self.qwen_device = None;
+                }
+                WorkerEvent::QwenClonePromptPreparing => {
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        "正在本机分析参考音频并创建克隆提示；同一参考音频只处理一次…",
+                        "Analyzing the reference locally and creating the clone prompt once…",
+                    ));
+                }
+                WorkerEvent::QwenClonePromptReady => {
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        "克隆提示已在本机就绪，正在使用同一音色生成…",
+                        "The local clone prompt is ready. Generating with the same voice…",
+                    ));
                 }
                 WorkerEvent::QwenProgress { current, total } => {
                     self.subtitle_progress = Some((current, total));
@@ -1078,6 +1172,7 @@ impl TtsApp {
             return;
         }
         let version = self.selected_qwen_version;
+        let kind = self.selected_qwen_kind();
         let Some(source_dir) = rfd::FileDialog::new()
             .set_title(self.ui_language.text(
                 "选择完整的 Qwen3-TTS 模型文件夹",
@@ -1090,6 +1185,7 @@ impl TtsApp {
 
         match self.command_tx.send(WorkerCommand::ImportQwenModel {
             version,
+            kind,
             source_dir: source_dir.clone(),
         }) {
             Ok(()) => {
@@ -1099,13 +1195,15 @@ impl TtsApp {
                 self.status = Some(StatusMessage::new(
                     StatusKind::Info,
                     format!(
-                        "正在检查并导入 Qwen3-TTS {}：{}",
+                        "正在检查并导入 Qwen3-TTS {} {}：{}",
                         version.short_label(),
+                        kind.short_label(),
                         source_dir.display()
                     ),
                     format!(
-                        "Checking and importing Qwen3-TTS {}: {}",
+                        "Checking and importing Qwen3-TTS {} {}: {}",
                         version.short_label(),
+                        kind.short_label(),
                         source_dir.display()
                     ),
                 ));
@@ -1130,11 +1228,8 @@ impl TtsApp {
         }
 
         let Some(voice) = self.active_voice_selection() else {
-            self.status = Some(StatusMessage::new(
-                StatusKind::Error,
-                "请先选择一个音色。",
-                "Choose a voice before generating audio.",
-            ));
+            let (chinese, english) = self.voice_selection_error();
+            self.status = Some(StatusMessage::new(StatusKind::Error, chinese, english));
             return;
         };
 
@@ -1315,11 +1410,8 @@ impl TtsApp {
         }
 
         let Some(voice) = self.active_voice_selection() else {
-            self.status = Some(StatusMessage::new(
-                StatusKind::Error,
-                "请先选择一个音色。",
-                "Choose a voice before previewing.",
-            ));
+            let (chinese, english) = self.voice_selection_error();
+            self.status = Some(StatusMessage::new(StatusKind::Error, chinese, english));
             return;
         };
 
@@ -1483,6 +1575,16 @@ impl TtsApp {
                         .text("尚未选择音色", "No voice selected")
                         .to_owned()
                 }),
+            TtsEngine::Qwen3Local if self.qwen_voice_mode == QwenVoiceMode::Clone => self
+                .clone_reference_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| {
+                    self.ui_language
+                        .text("尚未选择参考音频", "No reference audio")
+                })
+                .to_owned(),
             TtsEngine::Qwen3Local => match self.ui_language {
                 UiLanguage::Chinese => self.selected_qwen_voice.chinese_label().to_owned(),
                 UiLanguage::English => self.selected_qwen_voice.english_label().to_owned(),
@@ -1510,11 +1612,73 @@ impl TtsApp {
                 .selected_voice
                 .and_then(|index| self.voices.get(index))
                 .map(|voice| VoiceSelection::Edge(voice.short_name.clone())),
-            TtsEngine::Qwen3Local => Some(VoiceSelection::Qwen3(QwenSelection {
+            TtsEngine::Qwen3Local if self.qwen_voice_mode == QwenVoiceMode::Clone => {
+                let reference_path = self.clone_reference_path.as_ref()?;
+                (self.clone_authorized && reference_path.is_file()).then(|| {
+                    VoiceSelection::Qwen3Clone(QwenCloneSelection {
+                        version: self.selected_qwen_version,
+                        reference_path: reference_path.clone(),
+                        reference_text: self.clone_reference_text.trim().to_owned(),
+                    })
+                })
+            }
+            TtsEngine::Qwen3Local => Some(VoiceSelection::Qwen3Preset(QwenSelection {
                 version: self.selected_qwen_version,
                 voice: self.selected_qwen_voice,
             })),
         }
+    }
+
+    fn selected_qwen_kind(&self) -> QwenModelKind {
+        match self.qwen_voice_mode {
+            QwenVoiceMode::Preset => QwenModelKind::CustomVoice,
+            QwenVoiceMode::Clone => QwenModelKind::VoiceClone,
+        }
+    }
+
+    fn voice_selection_error(&self) -> (&'static str, &'static str) {
+        if self.tts_engine == TtsEngine::Qwen3Local && self.qwen_voice_mode == QwenVoiceMode::Clone
+        {
+            if self.clone_reference_path.is_none() {
+                return (
+                    "请先选择一段 WAV/MP3 参考音频。",
+                    "Choose a WAV/MP3 reference recording first.",
+                );
+            }
+            if !self.clone_authorized {
+                return (
+                    "请先确认已获得该声音所有者授权。",
+                    "Confirm that you have the voice owner's permission first.",
+                );
+            }
+        }
+        ("请先选择一个音色。", "Choose a voice first.")
+    }
+
+    fn choose_clone_reference(&mut self) {
+        if self.tts_controls_busy() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(self.ui_language.text(
+                "选择干净的单人参考音频",
+                "Choose a clean single-speaker reference",
+            ))
+            .add_filter(
+                self.ui_language.text("WAV / MP3 音频", "WAV / MP3 audio"),
+                &["wav", "mp3"],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        self.clone_reference_path = Some(path.clone());
+        self.clone_authorized = false;
+        self.status = Some(StatusMessage::new(
+            StatusKind::Info,
+            format!("已选择本地参考音频：{}", path.display()),
+            format!("Selected local reference audio: {}", path.display()),
+        ));
     }
 
     fn tts_controls_busy(&self) -> bool {
@@ -1627,17 +1791,18 @@ impl eframe::App for TtsApp {
 impl TtsApp {
     fn show_qwen_manual_help(&mut self, context: &egui::Context, language: UiLanguage) {
         let version = self.selected_qwen_version;
+        let kind = self.selected_qwen_kind();
         let mut open = self.qwen_manual_help_open;
         let mut import_clicked = false;
         let hf_command = format!(
             "huggingface-cli download {} --local-dir {}",
-            version.model_id(),
-            version.model_folder_name()
+            version.model_id(kind),
+            version.model_folder_name(kind)
         );
         let modelscope_command = format!(
             "modelscope download --model {} --local_dir {}",
-            version.model_id(),
-            version.model_folder_name()
+            version.model_id(kind),
+            version.model_folder_name(kind)
         );
 
         egui::Window::new(language.text("离线模型下载与导入", "Offline model download and import"))
@@ -1650,12 +1815,14 @@ impl TtsApp {
                 ui.label(
                     egui::RichText::new(match language {
                         UiLanguage::Chinese => format!(
-                            "自动下载失败时，请从下面任一官方模型页面下载完整的 Qwen3-TTS {} CustomVoice 文件夹。",
-                            version.short_label()
+                            "自动下载失败时，请从下面任一官方模型页面下载完整的 Qwen3-TTS {} {} 文件夹。",
+                            version.short_label(),
+                            kind.short_label()
                         ),
                         UiLanguage::English => format!(
-                            "If automatic download fails, download the complete Qwen3-TTS {} CustomVoice folder from either official model page below.",
-                            version.short_label()
+                            "If automatic download fails, download the complete Qwen3-TTS {} {} folder from either official model page below.",
+                            version.short_label(),
+                            kind.short_label()
                         ),
                     })
                     .size(13.0)
@@ -1663,9 +1830,9 @@ impl TtsApp {
                 );
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.hyperlink_to("Hugging Face", version.hugging_face_url());
+                    ui.hyperlink_to("Hugging Face", version.hugging_face_url(kind));
                     ui.label("·");
-                    ui.hyperlink_to("ModelScope（中国大陆）", version.model_scope_url());
+                    ui.hyperlink_to("ModelScope（中国大陆）", version.model_scope_url(kind));
                 });
                 ui.add_space(10.0);
                 ui.label(
@@ -1844,8 +2011,19 @@ impl TtsApp {
 
     fn show_voice_card(&mut self, ui: &mut egui::Ui, language: UiLanguage, card_height: f32) {
         let layout = VoiceCardLayout::for_height(card_height);
+        let clone_mode = self.tts_engine == TtsEngine::Qwen3Local
+            && self.qwen_voice_mode == QwenVoiceMode::Clone;
         card_frame().show(ui, |ui| {
-            ui.set_min_height((card_height - 36.0).max(0.0));
+            let scroll_height = (card_height - 36.0).max(0.0);
+            ui.set_height(scroll_height);
+            egui::ScrollArea::vertical()
+                .id_salt("voice-card-scroll")
+                .max_height(scroll_height)
+                .min_scrolled_height(scroll_height)
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             let operation_busy = self.previewing
                 || self.generating
                 || self.transcribing
@@ -1887,14 +2065,34 @@ impl TtsApp {
                 (TtsEngine::Edge, UiLanguage::English) => {
                     "Online Edge voices with multilingual search".to_owned()
                 }
+                (TtsEngine::Qwen3Local, UiLanguage::Chinese)
+                    if self.qwen_voice_mode == QwenVoiceMode::Clone =>
+                {
+                    format!(
+                        "Qwen3 {} Base · 3–15 秒干净单人录音 · 首次约 {}",
+                        self.selected_qwen_version.short_label(),
+                        self.selected_qwen_version.download_size_label()
+                    )
+                }
+                (TtsEngine::Qwen3Local, UiLanguage::English)
+                    if self.qwen_voice_mode == QwenVoiceMode::Clone =>
+                {
+                    format!(
+                        "Qwen3 {} Base · clean 3–15s voice · about {} first use",
+                        self.selected_qwen_version.short_label(),
+                        self.selected_qwen_version.download_size_label()
+                    )
+                }
                 (TtsEngine::Qwen3Local, UiLanguage::Chinese) => format!(
-                    "Qwen3 {} 本地生成 · 首次约 {}",
+                    "Qwen3 {} {} 本地生成 · 首次约 {}",
                     self.selected_qwen_version.short_label(),
+                    self.selected_qwen_kind().short_label(),
                     self.selected_qwen_version.download_size_label()
                 ),
                 (TtsEngine::Qwen3Local, UiLanguage::English) => format!(
-                    "Local Qwen3 {} · about {} on first use",
+                    "Local Qwen3 {} {} · about {} on first use",
                     self.selected_qwen_version.short_label(),
+                    self.selected_qwen_kind().short_label(),
                     self.selected_qwen_version.download_size_label()
                 ),
             };
@@ -1926,7 +2124,11 @@ impl TtsApp {
                             );
                             let qwen_small = engine_button(
                                 ui,
-                                language.text("Qwen 0.6B", "Qwen 0.6B"),
+                                if self.qwen_voice_mode == QwenVoiceMode::Clone {
+                                    "0.6B Base"
+                                } else {
+                                    "Qwen 0.6B"
+                                },
                                 self.tts_engine == TtsEngine::Qwen3Local
                                     && self.selected_qwen_version == QwenModelVersion::Small0_6B,
                                 segment_width,
@@ -1937,7 +2139,11 @@ impl TtsApp {
                             ));
                             let qwen_large = engine_button(
                                 ui,
-                                language.text("Qwen 1.7B", "Qwen 1.7B"),
+                                if self.qwen_voice_mode == QwenVoiceMode::Clone {
+                                    "1.7B Base"
+                                } else {
+                                    "Qwen 1.7B"
+                                },
                                 self.tts_engine == TtsEngine::Qwen3Local
                                     && self.selected_qwen_version == QwenModelVersion::Large1_7B,
                                 segment_width,
@@ -1968,6 +2174,45 @@ impl TtsApp {
                 }
             }
 
+            if self.tts_engine == TtsEngine::Qwen3Local {
+                ui.add_space(layout.field_gap);
+                egui::Frame::new()
+                    .fill(PRIMARY_SOFT)
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::same(3))
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!operation_busy, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let width = ((ui.available_width() - 4.0) / 2.0).max(90.0);
+                                let preset = mode_button(
+                                    ui,
+                                    language.text("预置音色", "Preset voices"),
+                                    self.qwen_voice_mode == QwenVoiceMode::Preset,
+                                    width,
+                                );
+                                let clone = mode_button(
+                                    ui,
+                                    language.text("音色克隆", "Voice clone"),
+                                    self.qwen_voice_mode == QwenVoiceMode::Clone,
+                                    width,
+                                );
+                                if preset.clicked() {
+                                    self.qwen_voice_mode = QwenVoiceMode::Preset;
+                                }
+                                if clone.clicked() {
+                                    self.qwen_voice_mode = QwenVoiceMode::Clone;
+                                }
+                            });
+                        });
+                    });
+            }
+
+            if self.tts_engine == TtsEngine::Qwen3Local
+                && self.qwen_voice_mode == QwenVoiceMode::Clone
+            {
+                self.show_clone_setup(ui, language, layout, busy);
+            } else {
             ui.add_space(layout.field_gap);
             ui.add_enabled_ui(!busy, |ui| {
                 input_frame().show(ui, |ui| {
@@ -2097,7 +2342,9 @@ impl TtsApp {
                     format!("{} Edge voices · {} shown", self.voices.len(), matching)
                 }
                 (TtsEngine::Qwen3Local, UiLanguage::Chinese) => {
-                    let state = if self.qwen_model_ready == Some(self.selected_qwen_version) {
+                    let state = if self.qwen_model_ready
+                        == Some((self.selected_qwen_version, QwenModelKind::CustomVoice))
+                    {
                         self.qwen_device.as_deref().unwrap_or("本地设备")
                     } else if self.qwen_model_preparing {
                         "准备中"
@@ -2110,7 +2357,9 @@ impl TtsApp {
                     )
                 }
                 (TtsEngine::Qwen3Local, UiLanguage::English) => {
-                    let state = if self.qwen_model_ready == Some(self.selected_qwen_version) {
+                    let state = if self.qwen_model_ready
+                        == Some((self.selected_qwen_version, QwenModelKind::CustomVoice))
+                    {
                         self.qwen_device.as_deref().unwrap_or("local device")
                     } else if self.qwen_model_preparing {
                         "preparing"
@@ -2184,13 +2433,18 @@ impl TtsApp {
                         .color(TEXT_SECONDARY),
                 );
             }
+            }
 
             ui.add_space(layout.section_gap);
             egui::Frame::new()
                 .fill(EDITOR_BACKGROUND)
                 .stroke(egui::Stroke::new(1.0, BORDER))
                 .corner_radius(10)
-                .inner_margin(egui::Margin::same(layout.settings_margin))
+                .inner_margin(egui::Margin::same(if clone_mode {
+                    6
+                } else {
+                    layout.settings_margin
+                }))
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.spacing_mut().interact_size.y = 26.0;
@@ -2239,7 +2493,11 @@ impl TtsApp {
                     egui::Color32::from_rgb(213, 220, 255),
                 ))
                 .corner_radius(11)
-                .inner_margin(egui::Margin::same(layout.preview_margin))
+                .inner_margin(egui::Margin::same(if clone_mode {
+                    4
+                } else {
+                    layout.preview_margin
+                }))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -2258,14 +2516,20 @@ impl TtsApp {
                             );
                         });
                     });
-                    ui.add_space(2.0);
-
-                    let (waveform_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), layout.waveform_height),
-                        egui::Sense::hover(),
-                    );
-                    paint_preview_waveform(ui, waveform_rect, self.previewing);
-                    ui.add_space(2.0);
+                    // Clone mode has several required setup controls above this
+                    // panel. Keep its actionable preview button inside the fixed
+                    // workspace by omitting the decorative waveform there.
+                    if !clone_mode {
+                        ui.add_space(2.0);
+                        let (waveform_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), layout.waveform_height),
+                            egui::Sense::hover(),
+                        );
+                        paint_preview_waveform(ui, waveform_rect, self.previewing);
+                        ui.add_space(2.0);
+                    } else {
+                        ui.add_space(3.0);
+                    }
 
                     let can_preview = !busy && self.active_voice_selection().is_some();
                     let preview_label = if self.previewing {
@@ -2299,6 +2563,178 @@ impl TtsApp {
                         self.start_preview();
                     }
                 });
+                });
+        });
+    }
+
+    fn show_clone_setup(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: UiLanguage,
+        layout: VoiceCardLayout,
+        busy: bool,
+    ) {
+        ui.add_space(layout.field_gap);
+        let selected_name = self
+            .clone_reference_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| language.text("尚未选择 WAV/MP3", "No WAV/MP3 selected"))
+            .to_owned();
+        input_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let button_width = if language == UiLanguage::Chinese {
+                    92.0
+                } else {
+                    108.0
+                };
+                let label_width = (ui.available_width() - button_width - 8.0).max(80.0);
+                ui.add_sized(
+                    egui::vec2(label_width, 28.0),
+                    egui::Label::new(egui::RichText::new(&selected_name).size(12.0).color(
+                        if self.clone_reference_path.is_some() {
+                            TEXT_PRIMARY
+                        } else {
+                            TEXT_SECONDARY
+                        },
+                    ))
+                    .truncate(),
+                )
+                .on_hover_text(&selected_name);
+                let choose = egui::Button::new(
+                    egui::RichText::new(language.text("选择音频", "Choose audio"))
+                        .size(11.0)
+                        .strong()
+                        .color(PRIMARY),
+                )
+                .fill(PRIMARY_SOFT)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(7)
+                .min_size(egui::vec2(button_width, 28.0));
+                if ui.add_enabled(!busy, choose).clicked() {
+                    self.choose_clone_reference();
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(language.text(
+                "参考音频原文（准确填写可提高克隆精度）",
+                "Reference transcript (exact text improves fidelity)",
+            ))
+            .size(11.0)
+            .color(TEXT_SECONDARY),
+        );
+        input_frame().show(ui, |ui| {
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut self.clone_reference_text)
+                    .desired_width(ui.available_width())
+                    .frame(egui::Frame::NONE)
+                    .text_color(TEXT_PRIMARY)
+                    .hint_text(language.text(
+                        "输入录音中实际说出的完整原文…",
+                        "Type exactly what is spoken…",
+                    )),
+            );
+        });
+
+        ui.add_space(3.0);
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.checkbox(
+                &mut self.clone_authorized,
+                egui::RichText::new(language.text(
+                    "我确认已获得该声音所有者授权",
+                    "I confirm I have the voice owner's permission",
+                ))
+                .size(11.0)
+                .color(TEXT_PRIMARY),
+            );
+        });
+
+        let kind = QwenModelKind::VoiceClone;
+        let state = if self.qwen_model_ready == Some((self.selected_qwen_version, kind)) {
+            self.qwen_device.as_deref().unwrap_or("local")
+        } else if self.qwen_model_preparing {
+            language.text("准备中", "preparing")
+        } else {
+            language.text("待加载", "not loaded")
+        };
+        let summary = match language {
+            UiLanguage::Chinese => format!(
+                "{} Base · {state}{}",
+                self.selected_qwen_version.short_label(),
+                if self.selected_qwen_version == QwenModelVersion::Large1_7B {
+                    " · 需更大统一内存"
+                } else {
+                    " · 推荐"
+                }
+            ),
+            UiLanguage::English => format!(
+                "{} Base · {state}{}",
+                self.selected_qwen_version.short_label(),
+                if self.selected_qwen_version == QwenModelVersion::Large1_7B {
+                    " · more unified memory"
+                } else {
+                    " · recommended"
+                }
+            ),
+        };
+        ui.horizontal(|ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let import_width = if language == UiLanguage::Chinese {
+                96.0
+            } else {
+                104.0
+            };
+            let summary_width = (ui.available_width() - import_width - 30.0 - gap * 2.0).max(80.0);
+            ui.add_sized(
+                egui::vec2(summary_width, layout.metadata_height),
+                egui::Label::new(
+                    egui::RichText::new(&summary)
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
+                )
+                .truncate(),
+            )
+            .on_hover_text(language.text(
+                "参考音频、原文、克隆提示和模型均只保留在本机",
+                "Reference audio, text, clone prompt, and model stay on this device",
+            ));
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("?").size(12.0).strong().color(PRIMARY))
+                        .fill(EDITOR_BACKGROUND)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .corner_radius(8)
+                        .min_size(egui::vec2(30.0, layout.metadata_height)),
+                )
+                .on_hover_text(language.text(
+                    "查看 Base 离线模型下载说明",
+                    "Show Base model download instructions",
+                ))
+                .clicked()
+            {
+                self.qwen_manual_help_open = true;
+            }
+            let import = egui::Button::new(
+                egui::RichText::new(language.text("＋ 离线模型", "+ Offline model"))
+                    .size(11.0)
+                    .strong()
+                    .color(PRIMARY),
+            )
+            .fill(PRIMARY_SOFT)
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(205, 214, 255),
+            ))
+            .corner_radius(8)
+            .min_size(egui::vec2(import_width, layout.metadata_height));
+            if ui.add_enabled(!busy, import).clicked() {
+                self.import_selected_qwen_model();
+            }
         });
     }
 
@@ -3152,6 +3588,10 @@ impl TtsApp {
                 "仅供个人学习与非商业研究，禁止商业使用；文本会发送至 Microsoft Edge 朗读服务。",
                 "Personal learning and noncommercial research only; text is sent to Microsoft Edge Read Aloud.",
             ),
+            TtsEngine::Qwen3Local if self.qwen_voice_mode == QwenVoiceMode::Clone => language.text(
+                "仅供个人学习与非商业研究，禁止商业使用；参考音频、原文与克隆提示均保留在本机，并须取得声音所有者授权。",
+                "Personal learning and noncommercial research only; reference audio, transcript, and clone prompt stay local, and voice-owner permission is required.",
+            ),
             TtsEngine::Qwen3Local => language.text(
                 "仅供个人学习与非商业研究，禁止商业使用；Qwen3 合成在本机完成，首次使用需下载模型。",
                 "Personal learning and noncommercial research only; Qwen3 synthesis stays local after its first model download.",
@@ -3525,6 +3965,7 @@ fn spawn_tts_worker() -> (
                 let cache_path = voice_cache_path();
                 let mut whisper_model: Option<(RecognitionLanguage, Whisper)> = None;
                 let mut qwen_model: Option<LocalQwenModel> = None;
+                let mut qwen_clone_prompt: Option<CachedQwenClonePrompt> = None;
 
                 while let Some(command) = command_rx.recv().await {
                     match command {
@@ -3548,10 +3989,24 @@ fn spawn_tts_worker() -> (
                                 )
                                 .await;
                             }
-                            VoiceSelection::Qwen3(selection) => {
+                            VoiceSelection::Qwen3Preset(selection) => {
                                 whisper_model = None;
+                                qwen_clone_prompt = None;
                                 preview_qwen_voice(
                                     &mut qwen_model,
+                                    &thread_event_tx,
+                                    text,
+                                    selection,
+                                    rate_percent,
+                                    volume_percent,
+                                )
+                                .await;
+                            }
+                            VoiceSelection::Qwen3Clone(selection) => {
+                                whisper_model = None;
+                                preview_qwen_clone(
+                                    &mut qwen_model,
+                                    &mut qwen_clone_prompt,
                                     &thread_event_tx,
                                     text,
                                     selection,
@@ -3580,8 +4035,9 @@ fn spawn_tts_worker() -> (
                                 )
                                 .await;
                             }
-                            VoiceSelection::Qwen3(selection) => {
+                            VoiceSelection::Qwen3Preset(selection) => {
                                 whisper_model = None;
+                                qwen_clone_prompt = None;
                                 generate_qwen_mp3(
                                     &mut qwen_model,
                                     &thread_event_tx,
@@ -3590,6 +4046,22 @@ fn spawn_tts_worker() -> (
                                     rate_percent,
                                     volume_percent,
                                     output_path,
+                                )
+                                .await;
+                            }
+                            VoiceSelection::Qwen3Clone(selection) => {
+                                whisper_model = None;
+                                generate_qwen_clone_mp3(
+                                    &mut qwen_model,
+                                    &mut qwen_clone_prompt,
+                                    &thread_event_tx,
+                                    text,
+                                    selection,
+                                    QwenOutputSettings {
+                                        rate_percent,
+                                        volume_percent,
+                                        output_path,
+                                    },
                                 )
                                 .await;
                             }
@@ -3613,8 +4085,9 @@ fn spawn_tts_worker() -> (
                                 )
                                 .await;
                             }
-                            VoiceSelection::Qwen3(selection) => {
+                            VoiceSelection::Qwen3Preset(selection) => {
                                 whisper_model = None;
+                                qwen_clone_prompt = None;
                                 generate_qwen_subtitle_mp3(
                                     &mut qwen_model,
                                     &thread_event_tx,
@@ -3626,12 +4099,30 @@ fn spawn_tts_worker() -> (
                                 )
                                 .await;
                             }
+                            VoiceSelection::Qwen3Clone(selection) => {
+                                whisper_model = None;
+                                generate_qwen_clone_subtitle_mp3(
+                                    &mut qwen_model,
+                                    &mut qwen_clone_prompt,
+                                    &thread_event_tx,
+                                    cues,
+                                    selection,
+                                    QwenOutputSettings {
+                                        rate_percent,
+                                        volume_percent,
+                                        output_path,
+                                    },
+                                )
+                                .await;
+                            }
                         },
                         WorkerCommand::ImportQwenModel {
                             version,
+                            kind,
                             source_dir,
                         } => {
                             whisper_model = None;
+                            qwen_clone_prompt = None;
                             if qwen_model.take().is_some() {
                                 let _ = thread_event_tx.send(WorkerEvent::QwenModelReleased);
                             }
@@ -3639,6 +4130,7 @@ fn spawn_tts_worker() -> (
                                 &mut qwen_model,
                                 &thread_event_tx,
                                 version,
+                                kind,
                                 &source_dir,
                             );
                         }
@@ -3648,6 +4140,7 @@ fn spawn_tts_worker() -> (
                             language,
                             format,
                         } => {
+                            qwen_clone_prompt = None;
                             if qwen_model.take().is_some() {
                                 let _ = thread_event_tx.send(WorkerEvent::QwenModelReleased);
                             }
@@ -3677,36 +4170,48 @@ fn import_qwen_model_locally(
     model_cache: &mut Option<LocalQwenModel>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
     version: QwenModelVersion,
+    kind: QwenModelKind,
     source_dir: &Path,
 ) {
     let progress_tx = event_tx.clone();
-    let model_dir = match qwen_local::import_offline_model(version, source_dir, move |progress| {
-        let _ = progress_tx.send(WorkerEvent::QwenModelImportProgress {
-            version,
-            file: progress.file.to_owned(),
-            copied_bytes: progress.downloaded_bytes,
-            total_bytes: progress.total_bytes,
-        });
-    }) {
-        Ok(model_dir) => model_dir,
-        Err(error) => {
-            let _ = event_tx.send(WorkerEvent::QwenModelImportFailed { version, error });
-            return;
-        }
-    };
+    let model_dir =
+        match qwen_local::import_offline_model(version, kind, source_dir, move |progress| {
+            let _ = progress_tx.send(WorkerEvent::QwenModelImportProgress {
+                version,
+                kind,
+                file: progress.file.to_owned(),
+                copied_bytes: progress.downloaded_bytes,
+                total_bytes: progress.total_bytes,
+            });
+        }) {
+            Ok(model_dir) => model_dir,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::QwenModelImportFailed {
+                    version,
+                    kind,
+                    error,
+                });
+                return;
+            }
+        };
 
-    match LocalQwenModel::load(version, |_| {}) {
+    match LocalQwenModel::load(version, kind, |_| {}) {
         Ok(model) => {
             let device = model.device_label().to_owned();
             *model_cache = Some(model);
             let _ = event_tx.send(WorkerEvent::QwenModelImported {
                 version,
+                kind,
                 device,
                 model_dir,
             });
         }
         Err(error) => {
-            let _ = event_tx.send(WorkerEvent::QwenModelImportFailed { version, error });
+            let _ = event_tx.send(WorkerEvent::QwenModelImportFailed {
+                version,
+                kind,
+                error,
+            });
         }
     }
 }
@@ -3835,20 +4340,22 @@ fn ensure_qwen_model<'a>(
     model_cache: &'a mut Option<LocalQwenModel>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
     version: QwenModelVersion,
+    kind: QwenModelKind,
 ) -> Result<&'a LocalQwenModel, String> {
     if model_cache
         .as_ref()
-        .is_some_and(|model| model.version() != version)
+        .is_some_and(|model| model.version() != version || model.kind() != kind)
     {
         *model_cache = None;
         let _ = event_tx.send(WorkerEvent::QwenModelReleased);
     }
     if model_cache.is_none() {
-        let _ = event_tx.send(WorkerEvent::QwenModelPreparing { version });
+        let _ = event_tx.send(WorkerEvent::QwenModelPreparing { version, kind });
         let progress_tx = event_tx.clone();
-        let model = LocalQwenModel::load(version, move |progress| {
+        let model = LocalQwenModel::load(version, kind, move |progress| {
             let _ = progress_tx.send(WorkerEvent::QwenModelDownload {
                 version,
+                kind,
                 file: progress.file.to_owned(),
                 downloaded_bytes: progress.downloaded_bytes,
                 total_bytes: progress.total_bytes,
@@ -3856,7 +4363,11 @@ fn ensure_qwen_model<'a>(
         })?;
         let device = model.device_label().to_owned();
         *model_cache = Some(model);
-        let _ = event_tx.send(WorkerEvent::QwenModelReady { version, device });
+        let _ = event_tx.send(WorkerEvent::QwenModelReady {
+            version,
+            kind,
+            device,
+        });
     }
     model_cache
         .as_ref()
@@ -3889,6 +4400,125 @@ fn synthesize_qwen_pcm(
     Ok(samples)
 }
 
+fn clone_prompt_key(selection: &QwenCloneSelection) -> Result<QwenClonePromptKey, String> {
+    let metadata = std::fs::metadata(&selection.reference_path).map_err(|error| {
+        format!(
+            "无法读取参考音频 {}：{error}",
+            selection.reference_path.display()
+        )
+    })?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Ok(QwenClonePromptKey {
+        version: selection.version,
+        reference_path: selection.reference_path.clone(),
+        reference_text: selection.reference_text.clone(),
+        file_len: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn ensure_qwen_clone_context<'a>(
+    model_cache: &'a mut Option<LocalQwenModel>,
+    prompt_cache: &'a mut Option<CachedQwenClonePrompt>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    selection: &QwenCloneSelection,
+) -> Result<(&'a LocalQwenModel, &'a LocalVoiceClonePrompt), String> {
+    let key = clone_prompt_key(selection)?;
+    let model = ensure_qwen_model(
+        model_cache,
+        event_tx,
+        selection.version,
+        QwenModelKind::VoiceClone,
+    )?;
+    if prompt_cache.as_ref().is_none_or(|cached| cached.key != key) {
+        let _ = event_tx.send(WorkerEvent::QwenClonePromptPreparing);
+        let reference_audio = qwen_local::load_reference_audio(&selection.reference_path)?;
+        let reference_text = (!selection.reference_text.trim().is_empty())
+            .then_some(selection.reference_text.trim());
+        let prompt = model.create_voice_clone_prompt(&reference_audio, reference_text)?;
+        *prompt_cache = Some(CachedQwenClonePrompt { key, prompt });
+        let _ = event_tx.send(WorkerEvent::QwenClonePromptReady);
+    }
+    let prompt = &prompt_cache
+        .as_ref()
+        .ok_or_else(|| "音色克隆提示未能完成初始化。".to_owned())?
+        .prompt;
+    Ok((model, prompt))
+}
+
+fn synthesize_qwen_clone_pcm(
+    model: &LocalQwenModel,
+    prompt: &LocalVoiceClonePrompt,
+    text: &str,
+    language: QwenSynthesisLanguage,
+    rate_percent: i32,
+    volume_percent: i32,
+) -> Result<Vec<f32>, String> {
+    let audio = model.synthesize_voice_clone(text, prompt, language)?;
+    if audio.samples.is_empty() {
+        return Err("Qwen3-TTS 音色克隆没有生成可用的音频采样。".to_owned());
+    }
+    let samples = if audio.sample_rate == timeline_audio::TIMELINE_SAMPLE_RATE {
+        audio.samples
+    } else {
+        timeline_audio::resample_linear(
+            &audio.samples,
+            audio.sample_rate,
+            timeline_audio::TIMELINE_SAMPLE_RATE,
+        )
+    };
+    let mut samples = timeline_audio::adjust_speed(&samples, rate_percent);
+    timeline_audio::apply_volume(&mut samples, volume_percent);
+    Ok(samples)
+}
+
+async fn preview_qwen_clone(
+    model_cache: &mut Option<LocalQwenModel>,
+    prompt_cache: &mut Option<CachedQwenClonePrompt>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    text: String,
+    selection: QwenCloneSelection,
+    rate_percent: i32,
+    volume_percent: i32,
+) {
+    let (model, prompt) =
+        match ensure_qwen_clone_context(model_cache, prompt_cache, event_tx, &selection) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::PreviewFailed(error));
+                return;
+            }
+        };
+    let language = qwen_local::synthesis_language_for_clone([text.as_str()]);
+    let samples = match synthesize_qwen_clone_pcm(
+        model,
+        prompt,
+        &text,
+        language,
+        rate_percent,
+        volume_percent,
+    ) {
+        Ok(samples) => samples,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::PreviewFailed(error));
+            return;
+        }
+    };
+    match timeline_audio::encode_mono_mp3(&samples) {
+        Ok(mp3) => play_preview_mp3(event_tx, mp3).await,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::PreviewFailed(format!(
+                "Qwen3-TTS 克隆试听编码失败：{error}"
+            )));
+        }
+    }
+}
+
 async fn preview_qwen_voice(
     model_cache: &mut Option<LocalQwenModel>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -3897,7 +4527,12 @@ async fn preview_qwen_voice(
     rate_percent: i32,
     volume_percent: i32,
 ) {
-    let model = match ensure_qwen_model(model_cache, event_tx, selection.version) {
+    let model = match ensure_qwen_model(
+        model_cache,
+        event_tx,
+        selection.version,
+        QwenModelKind::CustomVoice,
+    ) {
         Ok(model) => model,
         Err(error) => {
             let _ = event_tx.send(WorkerEvent::PreviewFailed(error));
@@ -3938,7 +4573,12 @@ async fn generate_qwen_mp3(
     volume_percent: i32,
     output_path: PathBuf,
 ) {
-    let model = match ensure_qwen_model(model_cache, event_tx, selection.version) {
+    let model = match ensure_qwen_model(
+        model_cache,
+        event_tx,
+        selection.version,
+        QwenModelKind::CustomVoice,
+    ) {
         Ok(model) => model,
         Err(error) => {
             let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
@@ -4011,6 +4651,90 @@ async fn generate_qwen_mp3(
     }
 }
 
+async fn generate_qwen_clone_mp3(
+    model_cache: &mut Option<LocalQwenModel>,
+    prompt_cache: &mut Option<CachedQwenClonePrompt>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    text: String,
+    selection: QwenCloneSelection,
+    settings: QwenOutputSettings,
+) {
+    let (model, prompt) =
+        match ensure_qwen_clone_context(model_cache, prompt_cache, event_tx, &selection) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+                return;
+            }
+        };
+    let chunks = qwen_local::split_for_synthesis(&text);
+    if chunks.is_empty() {
+        let _ = event_tx.send(WorkerEvent::GenerationFailed(
+            "没有可供 Qwen3-TTS 克隆音色合成的文字。".to_owned(),
+        ));
+        return;
+    }
+
+    let total = chunks.len();
+    // The language token and clone prompt are selected once for the complete
+    // article, then reused unchanged for every chunk.
+    let language = qwen_local::synthesis_language_for_clone([text.as_str()]);
+    let gap = vec![0.0_f32; timeline_audio::TIMELINE_SAMPLE_RATE as usize * 90 / 1_000];
+    let mut encoder = timeline_audio::TimelineMp3Encoder::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let current = index + 1;
+        let _ = event_tx.send(WorkerEvent::QwenProgress { current, total });
+        let samples = match synthesize_qwen_clone_pcm(
+            model,
+            prompt,
+            chunk,
+            language,
+            settings.rate_percent,
+            settings.volume_percent,
+        ) {
+            Ok(samples) => samples,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
+                    "第 {current}/{total} 段：{error}"
+                )));
+                return;
+            }
+        };
+        if let Err(error) = encoder.write_clip(&samples) {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+        if current < total
+            && let Err(error) = encoder.write_clip(&gap)
+        {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+    }
+
+    let mp3 = match encoder.finish() {
+        Ok(mp3) => mp3,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+    };
+    let byte_count = mp3.len();
+    match tokio::fs::write(&settings.output_path, mp3).await {
+        Ok(()) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFinished {
+                output_path: settings.output_path,
+                byte_count,
+            });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
+                "克隆音色已完成合成，但无法保存 MP3：{error}"
+            )));
+        }
+    }
+}
+
 async fn generate_qwen_subtitle_mp3(
     model_cache: &mut Option<LocalQwenModel>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -4026,7 +4750,12 @@ async fn generate_qwen_subtitle_mp3(
         ));
         return;
     }
-    let model = match ensure_qwen_model(model_cache, event_tx, selection.version) {
+    let model = match ensure_qwen_model(
+        model_cache,
+        event_tx,
+        selection.version,
+        QwenModelKind::CustomVoice,
+    ) {
         Ok(model) => model,
         Err(error) => {
             let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
@@ -4113,6 +4842,110 @@ async fn generate_qwen_subtitle_mp3(
         Err(error) => {
             let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
                 "Qwen3-TTS 字幕音频已完成，但无法保存 MP3：{error}"
+            )));
+        }
+    }
+}
+
+async fn generate_qwen_clone_subtitle_mp3(
+    model_cache: &mut Option<LocalQwenModel>,
+    prompt_cache: &mut Option<CachedQwenClonePrompt>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    cues: Vec<SubtitleCue>,
+    selection: QwenCloneSelection,
+    settings: QwenOutputSettings,
+) {
+    if cues.is_empty() {
+        let _ = event_tx.send(WorkerEvent::GenerationFailed(
+            "导入的字幕没有可合成的时间轴文本。".to_owned(),
+        ));
+        return;
+    }
+    let (model, prompt) =
+        match ensure_qwen_clone_context(model_cache, prompt_cache, event_tx, &selection) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+                return;
+            }
+        };
+
+    let total = cues.len();
+    // Deliberately lock both the language strategy and cloned prompt for the
+    // complete subtitle task. Chinese/English cue boundaries never select a
+    // different speaker or rebuild the prompt.
+    let language =
+        qwen_local::synthesis_language_for_clone(cues.iter().map(|cue| cue.text.as_str()));
+    let timeline_end_ms = cues.iter().map(|cue| cue.end_ms).max().unwrap_or(0);
+    let mut encoder = timeline_audio::TimelineMp3Encoder::new();
+    let mut overflow_count = 0;
+
+    for (index, cue) in cues.iter().enumerate() {
+        let current = index + 1;
+        let _ = event_tx.send(WorkerEvent::SubtitleProgress { current, total });
+        let cue_start_sample = timeline_audio::milliseconds_to_samples(cue.start_ms);
+        if let Err(error) = encoder.write_silence_until(cue_start_sample) {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+        let cue_slot_end_ms = cues
+            .get(index + 1)
+            .map(|next| cue.end_ms.min(next.start_ms))
+            .unwrap_or(cue.end_ms)
+            .max(cue.start_ms + 1);
+        let available_samples =
+            timeline_audio::milliseconds_to_samples(cue_slot_end_ms.saturating_sub(cue.start_ms))
+                as usize;
+        let clip = match synthesize_qwen_clone_pcm(
+            model,
+            prompt,
+            &cue.text,
+            language,
+            settings.rate_percent,
+            settings.volume_percent,
+        ) {
+            Ok(clip) => clip,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
+                    "字幕 {current}/{total}：{error}"
+                )));
+                return;
+            }
+        };
+        if clip.len() > available_samples {
+            overflow_count += 1;
+        }
+        if let Err(error) = encoder.write_clip(&clip) {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+    }
+
+    if let Err(error) =
+        encoder.write_silence_until(timeline_audio::milliseconds_to_samples(timeline_end_ms))
+    {
+        let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+        return;
+    }
+    let mp3 = match encoder.finish() {
+        Ok(mp3) => mp3,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(error));
+            return;
+        }
+    };
+    let byte_count = mp3.len();
+    match tokio::fs::write(&settings.output_path, mp3).await {
+        Ok(()) => {
+            let _ = event_tx.send(WorkerEvent::SubtitleGenerationFinished {
+                output_path: settings.output_path,
+                byte_count,
+                overflow_count,
+            });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GenerationFailed(format!(
+                "克隆音色字幕已完成合成，但无法保存 MP3：{error}"
             )));
         }
     }

@@ -20,11 +20,25 @@ filesystems to avoid wasting roughly another 660 MB. Only the selected version
 is held in memory. No Python, PyTorch, ONNX runtime, or external audio encoder
 is used.
 
+Qwen mode separates **Preset voices** from **Voice clone** so their models and
+controls cannot be confused. Voice cloning uses the official
+`Qwen3-TTS-12Hz-0.6B-Base` checkpoint by default; `1.7B-Base` is available as a
+higher-quality option with a larger unified-memory requirement. The user picks
+a clean, single-speaker WAV or MP3 reference (1–60 seconds, ideally 3–15), can
+enter its exact transcript for higher-fidelity ICL cloning, and must confirm
+that they have the voice owner's permission. Reference audio is decoded to
+24 kHz mono in Rust. Its clone prompt is computed once and reused for every
+text chunk or subtitle cue. The complete job also shares one language strategy,
+so alternating Chinese and English cues do not choose a different speaker.
+Reference audio, transcript, prompt tensors, and inference remain local.
+
 Automatic downloading is optional. After selecting Qwen 0.6B or Qwen 1.7B,
 click **Offline model** to import a complete folder downloaded from the official
-[0.6B model repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
-or [1.7B model repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice).
-The app validates that the folder is the selected CustomVoice version and
+[0.6B CustomVoice repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice),
+[1.7B CustomVoice repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice),
+[0.6B Base repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base), or
+[1.7B Base repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base).
+The app validates that the folder matches the selected CustomVoice/Base mode and
 requires `model.safetensors`, `config.json`,
 `speech_tokenizer/model.safetensors`, plus either `tokenizer.json` or both
 `vocab.json` and `merges.txt`. Same-volume files are hard-linked into the app
@@ -53,6 +67,7 @@ RustEdgeTTS/
 ├── examples/
 │   ├── edge_smoke.rs
 │   ├── qwen_smoke.rs
+│   ├── qwen_clone_smoke.rs
 │   ├── asr_smoke.rs
 │   └── subtitle_smoke.rs
 └── src/
@@ -102,6 +117,8 @@ cargo run --example subtitle_smoke
 cargo run --release --example asr_smoke
 cargo run --release --example qwen_smoke -- 0.6
 cargo run --release --example qwen_smoke -- 1.7
+# Real Base-model clone check (the transcript must match the recording):
+cargo run --release --example qwen_clone_smoke -- 0.6 /path/to/reference.wav "录音中的准确原文"
 # Optionally verify importing an already downloaded folder:
 cargo run --release --example qwen_smoke -- 1.7 /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
@@ -115,10 +132,11 @@ Hugging Face into the user's Application Support cache; later runs reuse those
 files and transcribe offline.
 
 Qwen3-TTS is substantially larger than the other dependencies, so the normal
-test suite validates model-version routing, mixed-language job locking, long-text
-segmentation, PCM speed/volume processing, and MP3 encoding without downloading
-both models. A real first-run synthesis is initiated from the app and requires
-enough free disk space and memory for the selected official checkpoint. The
+test suite validates model-version/type routing, mixed-language job locking,
+long-text segmentation, PCM speed/volume processing, and MP3 encoding without
+downloading all four checkpoints. The clone smoke example exercises a real Base
+model, local reference decoder, one-time prompt, and bilingual reuse. A real
+first-run synthesis requires enough free disk space and memory for the selected official checkpoint. The
 1.7B version uses materially more unified memory than 0.6B, so 0.6B remains the
 safer default on lower-memory Macs.
 
@@ -155,8 +173,9 @@ code signing.
 The main thread owns `eframe`/`egui`; all voice discovery, Edge/Qwen synthesis,
 model loading, cache I/O, and MP3 writing run in the background. A dedicated OS
 thread owns a two-thread Tokio runtime, a reusable `EdgeTtsClient`, and an
-on-demand Qwen model. When the requested Qwen version differs from the loaded
-one, the worker releases the old model before loading the selected version.
+on-demand Qwen model. When the requested Qwen version or type
+(CustomVoice/Base) differs from the loaded one, the worker releases the old
+model before loading the selected model.
 Two `tokio::sync::mpsc` channels
 carry commands to that worker and results back to the UI. The UI uses
 `try_recv`, so neither voice discovery nor synthesis can block rendering.
@@ -165,8 +184,8 @@ Subtitle files are decoded as UTF-8, UTF-16, or legacy Chinese GBK. Each cue is
 synthesized separately. The pipeline streams zero-valued PCM through silent
 gaps and encodes the combined 24 kHz mono timeline with the bundled pure-Rust
 MP3 codec, so the app does not require `ffmpeg` or `lame`. If a spoken cue is
-longer than its time slot, the app first requests a faster version of that cue;
-only a still-overlong result is faded and clipped to protect later timestamps.
+longer than its time slot, it continues at the user's selected speed and delays
+the following cue; speech is not automatically sped up or clipped.
 
 The voice catalogue is cached as JSON under the user's macOS cache directory.
 If a later refresh fails, the app can still show the last successful list.
@@ -207,9 +226,10 @@ proofread before publication. Whisper Large-v3 Turbo and its model
 configuration are MIT-licensed; model files are downloaded from their
 Hugging Face repositories rather than redistributed inside this app.
 
-The official Qwen3-TTS 0.6B and 1.7B CustomVoice checkpoints are Apache-2.0
-licensed and downloaded from their Qwen Hugging Face repositories rather than
-bundled in the installer. The
+The official Qwen3-TTS 0.6B/1.7B CustomVoice and Base checkpoints are
+Apache-2.0 licensed and downloaded from their Qwen Hugging Face repositories
+rather than bundled in the installer. Voice cloning must only be performed with
+a voice for which the user has authorization. The
 `speakers-qwen3-tts` Rust inference backend is a community Candle implementation,
 not an official Qwen Rust SDK. See `SERVICE_AND_VOICE_NOTICE.md` for the separate
 model, voice, generated-content, and noncommercial-project boundaries.

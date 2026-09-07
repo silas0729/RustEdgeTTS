@@ -5,7 +5,7 @@ mod qwen_local;
 #[path = "../src/timeline_audio.rs"]
 mod timeline_audio;
 
-use qwen_local::{LocalQwenModel, QwenModelVersion, QwenVoice};
+use qwen_local::{LocalQwenModel, QwenModelKind, QwenModelVersion, QwenVoice};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     configure_macos_proxy();
@@ -19,19 +19,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(source_dir) = std::env::args().nth(2) {
         println!("Importing offline model folder: {source_dir}");
-        let installed =
-            qwen_local::import_offline_model(version, std::path::Path::new(&source_dir), |_| {})?;
+        let installed = qwen_local::import_offline_model(
+            version,
+            QwenModelKind::CustomVoice,
+            std::path::Path::new(&source_dir),
+            |_| {},
+        )?;
         println!("Offline model installed at {}.", installed.display());
     }
 
     println!(
         "Preparing {} (the first run downloads {})…",
-        version.model_id(),
+        version.model_id(QwenModelKind::CustomVoice),
         version.download_size_label()
     );
     let mut previous_file = "";
     let mut previous_percent = u64::MAX;
-    let model = LocalQwenModel::load(version, |progress| {
+    let model = LocalQwenModel::load(version, QwenModelKind::CustomVoice, |progress| {
         let percent = progress
             .downloaded_bytes
             .saturating_mul(100)

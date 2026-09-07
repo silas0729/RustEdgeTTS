@@ -38,9 +38,13 @@ Microsoft、Microsoft Edge、Edge Read Aloud 以及相关名称和音色属于�
 
 本项目可由用户单独选择下载并在本机运行
 `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 或
-`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`。两个模型由 Qwen 团队发布，模型页面均标注为 Apache License 2.0；模型文件不包含在本项目安装包中。应用只加载用户当前选择的版本，0.6B 首次约需下载 2.4 GB，1.7B 首次约需下载 4.5 GB。`speakers-qwen3-tts` 是基于 Candle 的社区 Rust 推理实现，并非 Qwen 官方 Rust SDK。
+`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` 预置音色模型，也可单独选择
+`Qwen/Qwen3-TTS-12Hz-0.6B-Base` 或
+`Qwen/Qwen3-TTS-12Hz-1.7B-Base` 进行音色克隆。这些模型由 Qwen 团队发布，模型页面均标注为 Apache License 2.0；模型文件不包含在本项目安装包中。应用只加载用户当前选择的版本和类型，0.6B 首次约需下载 2.4 GB，1.7B 首次约需下载 4.5 GB。`speakers-qwen3-tts` 是基于 Candle 的社区 Rust 推理实现，并非 Qwen 官方 Rust SDK。
 
-模型既可由应用从官方 Hugging Face 仓库自动下载，也可由用户从 Hugging Face 或 ModelScope 官方页面完整下载后，通过“离线模型”按钮导入。导入操作会检查 CustomVoice 类型、0.6B/1.7B 版本和必要文件；不接受来源不明、文件不完整或版本不匹配的目录。应用不会将本地模型文件上传到任何服务。
+模型既可由应用从官方 Hugging Face 仓库自动下载，也可由用户从 Hugging Face 或 ModelScope 官方页面完整下载后，通过“离线模型”按钮导入。导入操作会检查 CustomVoice/Base 类型、0.6B/1.7B 版本和必要文件；不接受来源不明、文件不完整或版本不匹配的目录。应用不会将本地模型文件上传到任何服务。
+
+音色克隆仅允许用于用户本人声音，或已经获得声音所有者明确授权的声音。用户选择参考 WAV/MP3 后，参考音频、填写的原文、由模型计算的克隆提示以及生成过程均保留在本机，不上传至在线 TTS 服务。应用中的授权确认不代替真实、有效、范围充分的法律许可。禁止未经授权模仿公众人物、亲友、同事或其他任何第三方，禁止用于冒充、诈骗、误导、骚扰、诽谤或侵犯声音权、人格权及其他合法权益。
 
 Qwen3-TTS 模型、模型名称、预设音色、推理组件和生成内容分别受其适用许可证、模型条款及法律约束。本项目的 PolyForm Noncommercial 许可证仍然只允许将本项目作者代码用于个人学习和非商业研究；第三方组件采用更宽松许可证，并不会自动扩大本项目许可证授予的用途。
 
@@ -51,4 +55,6 @@ Qwen3-TTS 模型、模型名称、预设音色、推理组件和生成内容分�
 - Qwen3-TTS 官方项目：<https://github.com/QwenLM/Qwen3-TTS>
 - Qwen3-TTS 0.6B CustomVoice 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice>
 - Qwen3-TTS 1.7B CustomVoice 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice>
+- Qwen3-TTS 0.6B Base 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base>
+- Qwen3-TTS 1.7B Base 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base>
 - Apache License 2.0：<https://www.apache.org/licenses/LICENSE-2.0>

@@ -4,7 +4,29 @@ use std::{
 };
 
 use directories::{BaseDirs, ProjectDirs};
-use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions};
+use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions, VoiceClonePrompt};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QwenModelKind {
+    CustomVoice,
+    VoiceClone,
+}
+
+impl QwenModelKind {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::CustomVoice => "CustomVoice",
+            Self::VoiceClone => "Base",
+        }
+    }
+
+    fn config_type(self) -> &'static str {
+        match self {
+            Self::CustomVoice => "custom_voice",
+            Self::VoiceClone => "base",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QwenModelVersion {
@@ -22,31 +44,55 @@ impl QwenModelVersion {
         }
     }
 
-    pub fn model_id(self) -> &'static str {
-        match self {
-            Self::Small0_6B => "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            Self::Large1_7B => "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    pub fn model_id(self, kind: QwenModelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Small0_6B, QwenModelKind::CustomVoice) => "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            (Self::Large1_7B, QwenModelKind::CustomVoice) => "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            (Self::Small0_6B, QwenModelKind::VoiceClone) => "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            (Self::Large1_7B, QwenModelKind::VoiceClone) => "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         }
     }
 
-    pub fn model_folder_name(self) -> &'static str {
-        match self {
-            Self::Small0_6B => "Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            Self::Large1_7B => "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    pub fn model_folder_name(self, kind: QwenModelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Small0_6B, QwenModelKind::CustomVoice) => "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            (Self::Large1_7B, QwenModelKind::CustomVoice) => "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            (Self::Small0_6B, QwenModelKind::VoiceClone) => "Qwen3-TTS-12Hz-0.6B-Base",
+            (Self::Large1_7B, QwenModelKind::VoiceClone) => "Qwen3-TTS-12Hz-1.7B-Base",
         }
     }
 
-    pub fn hugging_face_url(self) -> &'static str {
-        match self {
-            Self::Small0_6B => "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            Self::Large1_7B => "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    pub fn hugging_face_url(self, kind: QwenModelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Small0_6B, QwenModelKind::CustomVoice) => {
+                "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+            }
+            (Self::Large1_7B, QwenModelKind::CustomVoice) => {
+                "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+            }
+            (Self::Small0_6B, QwenModelKind::VoiceClone) => {
+                "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+            }
+            (Self::Large1_7B, QwenModelKind::VoiceClone) => {
+                "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+            }
         }
     }
 
-    pub fn model_scope_url(self) -> &'static str {
-        match self {
-            Self::Small0_6B => "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            Self::Large1_7B => "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    pub fn model_scope_url(self, kind: QwenModelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Small0_6B, QwenModelKind::CustomVoice) => {
+                "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+            }
+            (Self::Large1_7B, QwenModelKind::CustomVoice) => {
+                "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+            }
+            (Self::Small0_6B, QwenModelKind::VoiceClone) => {
+                "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+            }
+            (Self::Large1_7B, QwenModelKind::VoiceClone) => {
+                "https://modelscope.cn/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+            }
         }
     }
 
@@ -57,17 +103,29 @@ impl QwenModelVersion {
         }
     }
 
-    fn cache_folder(self) -> &'static str {
-        match self {
-            Self::Small0_6B => "qwen3-tts-12hz-0.6b-customvoice",
-            Self::Large1_7B => "qwen3-tts-12hz-1.7b-customvoice",
+    fn cache_folder(self, kind: QwenModelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Small0_6B, QwenModelKind::CustomVoice) => "qwen3-tts-12hz-0.6b-customvoice",
+            (Self::Large1_7B, QwenModelKind::CustomVoice) => "qwen3-tts-12hz-1.7b-customvoice",
+            (Self::Small0_6B, QwenModelKind::VoiceClone) => "qwen3-tts-12hz-0.6b-base",
+            (Self::Large1_7B, QwenModelKind::VoiceClone) => "qwen3-tts-12hz-1.7b-base",
         }
     }
 
-    fn hugging_face_repo_folder(self) -> &'static str {
-        match self {
-            Self::Small0_6B => "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots",
-            Self::Large1_7B => "models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots",
+    fn hugging_face_repo_folder(self, kind: QwenModelKind) -> &'static str {
+        match (self, kind) {
+            (Self::Small0_6B, QwenModelKind::CustomVoice) => {
+                "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots"
+            }
+            (Self::Large1_7B, QwenModelKind::CustomVoice) => {
+                "models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots"
+            }
+            (Self::Small0_6B, QwenModelKind::VoiceClone) => {
+                "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots"
+            }
+            (Self::Large1_7B, QwenModelKind::VoiceClone) => {
+                "models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots"
+            }
         }
     }
 
@@ -225,7 +283,12 @@ impl QwenSynthesisLanguage {
 pub struct LocalQwenModel {
     model: Qwen3TTS,
     version: QwenModelVersion,
+    kind: QwenModelKind,
     device_label: String,
+}
+
+pub struct LocalVoiceClonePrompt {
+    prompt: VoiceClonePrompt,
 }
 
 impl LocalQwenModel {
@@ -234,9 +297,10 @@ impl LocalQwenModel {
     /// both the synchronous download and model initialization away from egui.
     pub fn load(
         version: QwenModelVersion,
+        kind: QwenModelKind,
         mut on_progress: impl FnMut(DownloadProgress),
     ) -> Result<Self, String> {
-        let model_dir = prepare_model_files(version, &mut on_progress)?;
+        let model_dir = prepare_model_files(version, kind, &mut on_progress)?;
         let device = qwen3_tts::auto_device()
             .map_err(|error| format!("无法初始化 Qwen3-TTS 推理设备：{error:#}"))?;
         let device_label = if device.is_metal() {
@@ -254,6 +318,7 @@ impl LocalQwenModel {
         Ok(Self {
             model,
             version,
+            kind,
             device_label,
         })
     }
@@ -264,6 +329,10 @@ impl LocalQwenModel {
 
     pub fn device_label(&self) -> &str {
         &self.device_label
+    }
+
+    pub fn kind(&self) -> QwenModelKind {
+        self.kind
     }
 
     pub fn synthesize(
@@ -311,6 +380,58 @@ impl LocalQwenModel {
             Err(error) => Err(format!("Qwen3-TTS 本地合成失败：{error:#}")),
         }
     }
+
+    pub fn create_voice_clone_prompt(
+        &self,
+        reference_audio: &AudioBuffer,
+        reference_text: Option<&str>,
+    ) -> Result<LocalVoiceClonePrompt, String> {
+        if self.kind != QwenModelKind::VoiceClone || !self.model.supports_voice_cloning() {
+            return Err("当前加载的不是 Qwen3-TTS Base 音色克隆模型。".to_owned());
+        }
+        self.model
+            .create_voice_clone_prompt(reference_audio, reference_text)
+            .map(|prompt| LocalVoiceClonePrompt { prompt })
+            .map_err(|error| format!("无法从参考音频创建克隆提示：{error:#}"))
+    }
+
+    pub fn synthesize_voice_clone(
+        &self,
+        text: &str,
+        prompt: &LocalVoiceClonePrompt,
+        language: QwenSynthesisLanguage,
+    ) -> Result<AudioBuffer, String> {
+        let mut options = SynthesisOptions {
+            max_length: synthesis_frame_budget(text),
+            seed: Some(42),
+            ..SynthesisOptions::default()
+        };
+        let first_attempt = self.model.synthesize_voice_clone(
+            text,
+            &prompt.prompt,
+            language.engine_language(),
+            Some(options.clone()),
+        );
+        match first_attempt {
+            Ok(audio) => Ok(audio),
+            Err(error) if is_metal_buffer_error(&format!("{error:#}")) => {
+                options.max_length = (options.max_length / 2).max(128);
+                self.model
+                    .synthesize_voice_clone(
+                        text,
+                        &prompt.prompt,
+                        language.engine_language(),
+                        Some(options),
+                    )
+                    .map_err(|retry_error| {
+                        format!(
+                            "Qwen3-TTS 音色克隆失败：Apple Metal 内存不足，缩小缓存重试后仍失败。请关闭占用内存较大的程序，或改用 0.6B Base。详情：{retry_error:#}"
+                        )
+                    })
+            }
+            Err(error) => Err(format!("Qwen3-TTS 音色克隆失败：{error:#}")),
+        }
+    }
 }
 
 fn is_metal_buffer_error(error: &str) -> bool {
@@ -328,17 +449,18 @@ struct ModelFile {
 
 fn prepare_model_files(
     version: QwenModelVersion,
+    kind: QwenModelKind,
     on_progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<PathBuf, String> {
     let project_dirs = ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
         .ok_or_else(|| "无法确定 Qwen3-TTS 模型缓存目录。".to_owned())?;
     let models_dir = project_dirs.cache_dir().join("models");
-    let model_dir = models_dir.join(version.cache_folder());
+    let model_dir = models_dir.join(version.cache_folder(kind));
     std::fs::create_dir_all(&model_dir)
         .map_err(|error| format!("无法创建 Qwen3-TTS 模型缓存目录：{error}"))?;
 
-    reuse_hugging_face_main_model(&model_dir, version);
-    reuse_shared_assets(&models_dir, &model_dir, version);
+    reuse_hugging_face_main_model(&model_dir, version, kind);
+    reuse_shared_assets(&models_dir, &model_dir, version, kind);
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(30 * 60))
@@ -349,14 +471,14 @@ fn prepare_model_files(
     let model_files = [
         ModelFile {
             label: "main-model",
-            repository: version.model_id(),
+            repository: version.model_id(kind),
             remote_path: "model.safetensors",
             local_path: "model.safetensors",
             minimum_size: version.minimum_main_model_size(),
         },
         ModelFile {
             label: "model-config",
-            repository: version.model_id(),
+            repository: version.model_id(kind),
             remote_path: "config.json",
             local_path: "config.json",
             minimum_size: 100,
@@ -384,7 +506,7 @@ fn prepare_model_files(
         let destination = model_dir.join(file.local_path);
         download_file(&client, file, &destination, on_progress)?;
     }
-    validate_ready_model_dir(&model_dir, version)?;
+    validate_ready_model_dir(&model_dir, version, kind)?;
     Ok(model_dir)
 }
 
@@ -393,16 +515,17 @@ fn prepare_model_files(
 /// makes future launches independent from the originally selected directory.
 pub fn import_offline_model(
     version: QwenModelVersion,
+    kind: QwenModelKind,
     selected_dir: &Path,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<PathBuf, String> {
-    let source_dir = locate_model_source(selected_dir, version)?;
-    validate_model_config(&source_dir.join("config.json"), version)?;
+    let source_dir = locate_model_source(selected_dir, version, kind)?;
+    validate_model_config(&source_dir.join("config.json"), version, kind)?;
 
     let project_dirs = ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
         .ok_or_else(|| "无法确定 Qwen3-TTS 模型缓存目录。".to_owned())?;
     let models_dir = project_dirs.cache_dir().join("models");
-    let destination_dir = models_dir.join(version.cache_folder());
+    let destination_dir = models_dir.join(version.cache_folder(kind));
     std::fs::create_dir_all(&destination_dir)
         .map_err(|error| format!("无法创建本地模型目录：{error}"))?;
 
@@ -460,14 +583,18 @@ pub fn import_offline_model(
         }
     }
 
-    reuse_shared_assets(&models_dir, &destination_dir, version);
-    validate_ready_model_dir(&destination_dir, version)?;
+    reuse_shared_assets(&models_dir, &destination_dir, version, kind);
+    validate_ready_model_dir(&destination_dir, version, kind)?;
     Ok(destination_dir)
 }
 
-fn locate_model_source(selected_dir: &Path, version: QwenModelVersion) -> Result<PathBuf, String> {
+fn locate_model_source(
+    selected_dir: &Path,
+    version: QwenModelVersion,
+    kind: QwenModelKind,
+) -> Result<PathBuf, String> {
     let direct = selected_dir.to_path_buf();
-    let nested = selected_dir.join(version.model_folder_name());
+    let nested = selected_dir.join(version.model_folder_name(kind));
     let source = if direct.join("model.safetensors").is_file() {
         direct
     } else if nested.join("model.safetensors").is_file() {
@@ -475,29 +602,37 @@ fn locate_model_source(selected_dir: &Path, version: QwenModelVersion) -> Result
     } else {
         return Err(format!(
             "所选文件夹中没有找到 {} 的 model.safetensors。请选择完整模型文件夹，而不是单个文件。",
-            version.model_folder_name()
+            version.model_folder_name(kind)
         ));
     };
     Ok(source)
 }
 
-fn validate_model_config(config_path: &Path, version: QwenModelVersion) -> Result<(), String> {
+fn validate_model_config(
+    config_path: &Path,
+    version: QwenModelVersion,
+    kind: QwenModelKind,
+) -> Result<(), String> {
     let bytes =
         std::fs::read(config_path).map_err(|error| format!("无法读取模型 config.json：{error}"))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("模型 config.json 格式无效：{error}"))?;
-    validate_model_config_value(&value, version)
+    validate_model_config_value(&value, version, kind)
 }
 
 fn validate_model_config_value(
     value: &serde_json::Value,
     version: QwenModelVersion,
+    kind: QwenModelKind,
 ) -> Result<(), String> {
     let model_type = value
         .get("tts_model_type")
         .and_then(serde_json::Value::as_str);
-    if model_type != Some("custom_voice") {
-        return Err("所选目录不是 Qwen3-TTS CustomVoice 模型。".to_owned());
+    if model_type != Some(kind.config_type()) {
+        return Err(format!(
+            "所选目录不是 Qwen3-TTS {} 模型。",
+            kind.short_label()
+        ));
     }
     let hidden_size = value
         .pointer("/talker_config/hidden_size")
@@ -519,8 +654,12 @@ fn validate_model_config_value(
     Ok(())
 }
 
-fn validate_ready_model_dir(model_dir: &Path, version: QwenModelVersion) -> Result<(), String> {
-    validate_model_config(&model_dir.join("config.json"), version)?;
+fn validate_ready_model_dir(
+    model_dir: &Path,
+    version: QwenModelVersion,
+    kind: QwenModelKind,
+) -> Result<(), String> {
+    validate_model_config(&model_dir.join("config.json"), version, kind)?;
     if !valid_file(
         &model_dir.join("model.safetensors"),
         version.minimum_main_model_size(),
@@ -625,7 +764,7 @@ fn import_file(
     Ok(())
 }
 
-fn reuse_hugging_face_main_model(model_dir: &Path, version: QwenModelVersion) {
+fn reuse_hugging_face_main_model(model_dir: &Path, version: QwenModelVersion, kind: QwenModelKind) {
     let destination = model_dir.join("model.safetensors");
     if valid_file(&destination, version.minimum_main_model_size()) {
         return;
@@ -636,7 +775,7 @@ fn reuse_hugging_face_main_model(model_dir: &Path, version: QwenModelVersion) {
     let snapshots = base_dirs
         .home_dir()
         .join(".cache/huggingface/hub")
-        .join(version.hugging_face_repo_folder());
+        .join(version.hugging_face_repo_folder(kind));
     let Ok(entries) = std::fs::read_dir(snapshots) else {
         return;
     };
@@ -651,17 +790,29 @@ fn reuse_hugging_face_main_model(model_dir: &Path, version: QwenModelVersion) {
     try_reuse_file(&existing, &destination, version.minimum_main_model_size());
 }
 
-fn reuse_shared_assets(models_dir: &Path, model_dir: &Path, version: QwenModelVersion) {
-    let other_dir = models_dir.join(version.other().cache_folder());
-    for (relative_path, minimum_size) in [
-        ("speech_tokenizer/model.safetensors", 500_000_000),
-        ("tokenizer.json", 1_000_000),
-    ] {
-        try_reuse_file(
-            &other_dir.join(relative_path),
-            &model_dir.join(relative_path),
-            minimum_size,
-        );
+fn reuse_shared_assets(
+    models_dir: &Path,
+    model_dir: &Path,
+    version: QwenModelVersion,
+    kind: QwenModelKind,
+) {
+    for candidate_version in [version, version.other()] {
+        for candidate_kind in [QwenModelKind::CustomVoice, QwenModelKind::VoiceClone] {
+            if candidate_version == version && candidate_kind == kind {
+                continue;
+            }
+            let other_dir = models_dir.join(candidate_version.cache_folder(candidate_kind));
+            for (relative_path, minimum_size) in [
+                ("speech_tokenizer/model.safetensors", 500_000_000),
+                ("tokenizer.json", 1_000_000),
+            ] {
+                try_reuse_file(
+                    &other_dir.join(relative_path),
+                    &model_dir.join(relative_path),
+                    minimum_size,
+                );
+            }
+        }
     }
 }
 
@@ -847,6 +998,96 @@ pub fn synthesis_language<'a>(
     }
 }
 
+/// Voice cloning has no preset speaker language to use as a fallback. The
+/// complete job is still inspected once so mixed Chinese/English content uses
+/// one stable language token for every chunk and subtitle cue.
+pub fn synthesis_language_for_clone<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+) -> QwenSynthesisLanguage {
+    synthesis_language_with_fallback(texts, QwenSynthesisLanguage::Chinese)
+}
+
+fn synthesis_language_with_fallback<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    fallback: QwenSynthesisLanguage,
+) -> QwenSynthesisLanguage {
+    let mut has_han = false;
+    let mut has_kana = false;
+    let mut has_hangul = false;
+    let mut has_latin = false;
+
+    for character in texts.into_iter().flat_map(str::chars) {
+        has_han |= is_han(character);
+        has_kana |= is_japanese_kana(character);
+        has_hangul |= is_hangul(character);
+        has_latin |= character.is_ascii_alphabetic();
+    }
+
+    if has_kana {
+        QwenSynthesisLanguage::Japanese
+    } else if has_hangul {
+        QwenSynthesisLanguage::Korean
+    } else if has_han {
+        QwenSynthesisLanguage::Chinese
+    } else if has_latin {
+        QwenSynthesisLanguage::English
+    } else {
+        fallback
+    }
+}
+
+/// Decode a local voice-cloning reference. MP3 uses the same Rust decoder as
+/// generated audio; WAV uses the Qwen crate's hound-backed loader. Nothing is
+/// uploaded or copied outside the worker process.
+pub fn load_reference_audio(path: &Path) -> Result<AudioBuffer, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut audio = match extension.as_str() {
+        "wav" => {
+            AudioBuffer::load(path).map_err(|error| format!("无法读取 WAV 参考音频：{error:#}"))?
+        }
+        "mp3" => {
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("无法读取 MP3 参考音频：{error}"))?;
+            let samples = crate::timeline_audio::decode_mp3_mono_preserving_silence(&bytes)
+                .map_err(|error| format!("无法解码 MP3 参考音频：{error}"))?;
+            AudioBuffer::new(samples, crate::timeline_audio::TIMELINE_SAMPLE_RATE)
+        }
+        _ => return Err("参考音频仅支持 WAV 或 MP3。".to_owned()),
+    };
+
+    if audio.sample_rate == 0 || audio.samples.is_empty() {
+        return Err("参考音频没有可用的声音采样。".to_owned());
+    }
+    if audio.samples.iter().any(|sample| !sample.is_finite()) {
+        return Err("参考音频包含无效采样，请重新导出为标准 WAV 或 MP3。".to_owned());
+    }
+    if audio.sample_rate != crate::timeline_audio::TIMELINE_SAMPLE_RATE {
+        audio.samples = crate::timeline_audio::resample_linear(
+            &audio.samples,
+            audio.sample_rate,
+            crate::timeline_audio::TIMELINE_SAMPLE_RATE,
+        );
+        audio.sample_rate = crate::timeline_audio::TIMELINE_SAMPLE_RATE;
+    }
+    if audio.samples.iter().all(|sample| sample.abs() < 0.0005) {
+        return Err("参考音频几乎完全静音，请选择清晰的人声录音。".to_owned());
+    }
+    for sample in &mut audio.samples {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+    let duration = audio.duration();
+    if !(1.0..=60.0).contains(&duration) {
+        return Err(format!(
+            "参考音频时长为 {duration:.1} 秒；请选择 1–60 秒的单人清晰人声（推荐 3–15 秒）。"
+        ));
+    }
+    Ok(audio)
+}
+
 fn synthesis_frame_budget(text: &str) -> usize {
     let cjk_characters = text
         .chars()
@@ -962,8 +1203,13 @@ mod tests {
     #[test]
     fn model_versions_have_independent_ids_and_cache_sizes() {
         assert_ne!(
-            QwenModelVersion::Small0_6B.model_id(),
-            QwenModelVersion::Large1_7B.model_id()
+            QwenModelVersion::Small0_6B.model_id(QwenModelKind::CustomVoice),
+            QwenModelVersion::Large1_7B.model_id(QwenModelKind::CustomVoice)
+        );
+        assert!(
+            QwenModelVersion::Small0_6B
+                .model_id(QwenModelKind::VoiceClone)
+                .ends_with("-Base")
         );
         assert!(
             QwenModelVersion::Large1_7B.minimum_main_model_size()
@@ -987,9 +1233,53 @@ mod tests {
             "talker_config": { "hidden_size": 1024 }
         });
 
-        assert!(validate_model_config_value(&small, QwenModelVersion::Small0_6B).is_ok());
-        assert!(validate_model_config_value(&large, QwenModelVersion::Large1_7B).is_ok());
-        assert!(validate_model_config_value(&small, QwenModelVersion::Large1_7B).is_err());
-        assert!(validate_model_config_value(&base, QwenModelVersion::Small0_6B).is_err());
+        assert!(
+            validate_model_config_value(
+                &small,
+                QwenModelVersion::Small0_6B,
+                QwenModelKind::CustomVoice
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_model_config_value(
+                &large,
+                QwenModelVersion::Large1_7B,
+                QwenModelKind::CustomVoice
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_model_config_value(
+                &small,
+                QwenModelVersion::Large1_7B,
+                QwenModelKind::CustomVoice
+            )
+            .is_err()
+        );
+        assert!(
+            validate_model_config_value(
+                &base,
+                QwenModelVersion::Small0_6B,
+                QwenModelKind::VoiceClone
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_model_config_value(
+                &base,
+                QwenModelVersion::Small0_6B,
+                QwenModelKind::CustomVoice
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clone_language_is_locked_for_a_mixed_track() {
+        assert_eq!(
+            synthesis_language_for_clone(["第一句中文", "The second cue is English"]),
+            QwenSynthesisLanguage::Chinese
+        );
     }
 }
