@@ -58,3 +58,20 @@ Qwen3-TTS 模型、模型名称、预设音色、推理组件和生成内容分�
 - Qwen3-TTS 0.6B Base 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base>
 - Qwen3-TTS 1.7B Base 模型页：<https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base>
 - Apache License 2.0：<https://www.apache.org/licenses/LICENSE-2.0>
+
+## IndexTTS-2.5 本地语音功能
+
+本项目可按用户明确操作下载并运行 IndexTTS 官方仓库的 v2.5.0 版本及
+`IndexTeam/IndexTTS-2.5` 模型。应用会校验固定的官方源码提交，通过隔离的
+`uv` 环境调用官方 Python/PyTorch 推理代码，并在支持的设备上使用 MPS、CUDA
+或 CPU。源码、模型和参考音频不会由本项目上传；模型文件不包含在安装包中。
+
+IndexTTS 源码、模型和生成内容受官方仓库中的许可证、模型许可证及免责声明
+约束，本项目许可证不会替用户授予任何额外的声音权、人格权、商业使用权或
+再分发权。使用零样本音色克隆前，用户必须已经取得声音所有者明确、真实且
+范围充分的授权。禁止用于冒充、诈骗、误导、骚扰或其他侵权、违法用途。
+
+参考资料：
+
+- IndexTTS 官方项目：<https://github.com/index-tts/index-tts>
+- IndexTTS-2.5 官方模型页：<https://huggingface.co/IndexTeam/IndexTTS-2.5>

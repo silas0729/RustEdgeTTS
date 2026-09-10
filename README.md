@@ -1,7 +1,7 @@
 # Edge TTS Studio
 
 A lightweight Rust desktop GUI for macOS and Windows. It combines Microsoft Edge Read Aloud
-voices with an optional, fully local Qwen3-TTS engine, accepts multiline text, and writes
+voices with optional local Qwen3-TTS and IndexTTS-2.5 engines, accepts multiline text, and writes
 synthesized speech to an MP3 file.
 The interface defaults to Chinese, can switch to English, supports bilingual
 voice search, one-click voice previews, speech-rate and volume controls,
@@ -32,6 +32,17 @@ text chunk or subtitle cue. The complete job also shares one language strategy,
 so alternating Chinese and English cues do not choose a different speaker.
 Reference audio, transcript, prompt tensors, and inference remain local.
 
+IndexTTS mode is pinned to the official **IndexTTS-2.5 v2.5.0** release
+(commit `39207d91c30899cad1e7c1b9eb678c241f678e55`). It provides zero-shot voice
+cloning from a WAV/MP3 reference and uses the official Python/PyTorch inference
+code, including Apple MPS on supported Macs and CUDA on supported Windows/Linux
+machines. The explicit first setup runs outside the UI thread, verifies the
+official Git revision, creates an isolated `uv` environment, and reports model
+download byte progress in the app. Git and `uv` must be installed; downloaded
+files are resumable and remain in the application cache. IndexTTS is not
+presented as a native Rust engine because no compatible official Rust runtime is
+available.
+
 Automatic downloading is optional. After selecting Qwen 0.6B or Qwen 1.7B,
 click **Offline model** to import a complete folder downloaded from the official
 [0.6B CustomVoice repository](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice),
@@ -47,11 +58,14 @@ If automatic downloading fails, the app opens this download/import guide
 automatically and also offers the corresponding official ModelScope page for
 users in mainland China.
 
-The second workspace turns an MP3 back into SRT or WebVTT subtitles with a
+The second workspace turns audio, or the audio track inside MP4/MOV/M4V/MKV/WebM
+video, into SRT or WebVTT subtitles with a
 local, quantized Whisper Large-v3 Turbo model. Chinese/English mixed recognition
 is the default, with dedicated Chinese-only and English-only modes also
-available. Inference runs through Rust/Candle with Metal acceleration on macOS;
-it does not call Python, `whisper.cpp`, FFmpeg, or a cloud transcription API.
+available. Results appear in an editable cue list and are saved only after the
+user has proofread them. Inference runs through Rust/Candle with Metal acceleration
+on macOS; media audio tracks are decoded directly in Rust without requiring
+Python, `whisper.cpp`, FFmpeg, or a cloud transcription API.
 
 ## Project structure
 
@@ -72,6 +86,7 @@ RustEdgeTTS/
 │   └── subtitle_smoke.rs
 └── src/
     ├── asr.rs                  # local Whisper inference and SRT/VTT export
+    ├── indextts.rs             # official IndexTTS-2.5 runtime/download bridge
     ├── main.rs                 # egui UI and Tokio channel worker
     ├── qwen_local.rs           # local Qwen3-TTS model and job-level language lock
     ├── subtitle_pipeline.rs    # asynchronous per-cue TTS orchestration
@@ -191,12 +206,14 @@ The voice catalogue is cached as JSON under the user's macOS cache directory.
 If a later refresh fails, the app can still show the last successful list.
 
 Local transcription reuses the same background channel architecture. MP3 is
-decoded to mono PCM in Rust, resampled by the recognition pipeline, and sent to
+decoded to mono PCM in Rust; supported video containers are demuxed directly
+and their audio tracks are decoded without creating an intermediate media file.
+Audio is resampled by the recognition pipeline and sent to
 the quantized multilingual Whisper model. Long audio is split at quiet points
 into windows shorter than Whisper's internal 30-second boundary so a mistaken
 no-speech decision cannot discard a complete block. Invalid padded tail
 segments are ignored, while valid word timestamps are grouped at Chinese and
-English sentence boundaries into readable subtitle cues. The small public model
+English sentence boundaries into readable, directly editable subtitle cues. The small public model
 configuration is embedded in the binary so a transient network failure after
 the large weight download cannot invalidate the first run.
 
@@ -233,6 +250,11 @@ a voice for which the user has authorization. The
 `speakers-qwen3-tts` Rust inference backend is a community Candle implementation,
 not an official Qwen Rust SDK. See `SERVICE_AND_VOICE_NOTICE.md` for the separate
 model, voice, generated-content, and noncommercial-project boundaries.
+
+IndexTTS-2.5 source and checkpoints are downloaded from the official
+`index-tts/index-tts` and `IndexTeam/IndexTTS-2.5` repositories and remain
+subject to their own code/model licenses. The user must have permission for any
+reference voice used for cloning.
 
 ## License and commercial use
 

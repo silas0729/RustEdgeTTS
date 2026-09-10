@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::ErrorKind,
     ops::Range,
     path::{Path, PathBuf},
     time::Instant,
@@ -8,6 +10,15 @@ use directories::BaseDirs;
 use futures_util::StreamExt;
 use rodio::buffer::SamplesBuffer;
 use rwhisper::{ModelLoadingProgress, Whisper, WhisperLanguage, WhisperSource};
+use symphonia::core::{
+    audio::SampleBuffer,
+    codecs::DecoderOptions,
+    errors::Error as SymphoniaError,
+    formats::FormatOptions,
+    io::{MediaSourceStream, MediaSourceStreamOptions},
+    meta::MetadataOptions,
+    probe::Hint,
+};
 
 use crate::{
     subtitles::SubtitleCue,
@@ -120,18 +131,17 @@ async fn ensure_model_config() -> Result<(), String> {
         .map_err(|error| format!("Could not prepare the local model configuration: {error}"))
 }
 
-pub async fn transcribe_mp3(
+pub async fn transcribe_media(
     model: &Whisper,
     input_path: &Path,
     mut on_progress: impl FnMut(f32, u64) + Send,
 ) -> Result<TranscriptionReport, String> {
-    let bytes = tokio::fs::read(input_path)
+    let decode_path = input_path.to_path_buf();
+    let samples = tokio::task::spawn_blocking(move || decode_media_mono(&decode_path))
         .await
-        .map_err(|error| format!("Could not read the MP3 file: {error}"))?;
-    let samples = decode_mp3_mono_preserving_silence(&bytes)
-        .map_err(|error| format!("Could not decode the MP3 file: {error}"))?;
+        .map_err(|error| format!("The media decoding task failed: {error}"))??;
     if samples.is_empty() {
-        return Err("The MP3 file does not contain decodable audio.".to_owned());
+        return Err("The selected media file does not contain a decodable audio track.".to_owned());
     }
 
     let audio_duration_ms = samples.len() as u64 * 1_000 / u64::from(TIMELINE_SAMPLE_RATE);
@@ -203,6 +213,118 @@ pub async fn transcribe_mp3(
         cues,
         audio_duration_ms,
     })
+}
+
+/// Decode an audio file or the audio track embedded in a common video
+/// container. MP3 keeps the project's gap-preserving decoder; MP4/MOV/MKV and
+/// other supported containers go through Symphonia and are mixed to mono once.
+pub(crate) fn decode_media_mono(path: &Path) -> Result<Vec<f32>, String> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
+    {
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("Could not read the MP3 file: {error}"))?;
+        return decode_mp3_mono_preserving_silence(&bytes)
+            .map_err(|error| format!("Could not decode the MP3 file: {error}"));
+    }
+
+    let file = File::open(path)
+        .map_err(|error| format!("Could not open the selected media file: {error}"))?;
+    let stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(extension);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| format!("Could not read the media container: {error}"))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        // Compressed AAC tracks often declare their sample rate before the
+        // decoder has discovered the channel layout. Video tracks do not have
+        // an audio sample rate, so this reliably selects the embedded audio.
+        .find(|track| track.codec_params.sample_rate.is_some())
+        .ok_or_else(|| {
+            "No supported audio track was found in the selected media file.".to_owned()
+        })?;
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let mut source_rate = codec_params
+        .sample_rate
+        .ok_or_else(|| "The media audio track does not declare a sample rate.".to_owned())?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|error| format!("The media audio codec is not supported: {error}"))?;
+    let mut mono = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => {
+                return Err("The media audio track changes format part-way through and cannot be transcribed.".to_owned());
+            }
+            Err(error) => return Err(format!("Could not read the media audio track: {error}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(error) => return Err(format!("Could not decode the media audio track: {error}")),
+        };
+        let spec = *decoded.spec();
+        if spec.rate != source_rate {
+            if mono.is_empty() {
+                source_rate = spec.rate;
+            } else {
+                return Err(
+                    "The media audio track changes sample rate part-way through.".to_owned(),
+                );
+            }
+        }
+        let channels = spec.channels.count().max(1);
+        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        samples.copy_interleaved_ref(decoded);
+        if channels == 1 {
+            mono.extend_from_slice(samples.samples());
+        } else {
+            mono.reserve(samples.samples().len() / channels);
+            for frame in samples.samples().chunks_exact(channels) {
+                mono.push(frame.iter().copied().sum::<f32>() / channels as f32);
+            }
+        }
+    }
+
+    if source_rate != TIMELINE_SAMPLE_RATE {
+        mono = crate::timeline_audio::resample_linear(&mono, source_rate, TIMELINE_SAMPLE_RATE);
+    }
+    Ok(mono)
+}
+
+/// Kept for the public smoke example and downstream callers.
+#[allow(dead_code)]
+pub async fn transcribe_mp3(
+    model: &Whisper,
+    input_path: &Path,
+    on_progress: impl FnMut(f32, u64) + Send,
+) -> Result<TranscriptionReport, String> {
+    transcribe_media(model, input_path, on_progress).await
 }
 
 fn split_audio_windows(samples: &[f32], sample_rate: u32) -> Vec<Range<usize>> {
@@ -497,6 +619,29 @@ fn subtitle_timestamp(milliseconds: u64, separator: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decodes_aac_audio_from_an_mp4_container() {
+        let source = Path::new("/System/Library/Sounds/Basso.aiff");
+        if !source.is_file() {
+            return;
+        }
+        let output = std::env::temp_dir().join(format!(
+            "edge-tts-studio-media-decode-{}.mp4",
+            std::process::id()
+        ));
+        let status = std::process::Command::new("/usr/bin/afconvert")
+            .arg(source)
+            .arg(&output)
+            .args(["-f", "m4af", "-d", "aac"])
+            .status()
+            .expect("macOS includes afconvert");
+        assert!(status.success());
+        let samples = decode_media_mono(&output).expect("decode AAC from ISO MP4");
+        let _ = std::fs::remove_file(output);
+        assert!(samples.len() > TIMELINE_SAMPLE_RATE as usize / 4);
+    }
 
     #[test]
     fn splits_a_mixed_utterance_at_sentence_boundaries() {
