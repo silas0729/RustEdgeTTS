@@ -10,9 +10,14 @@ use std::{
 
 use directories::ProjectDirs;
 
+use crate::download_control::{
+    DOWNLOAD_CANCELLED_ERROR, DownloadControl, DownloadState, model_download_control,
+};
+
 pub const OFFICIAL_TAG: &str = "v2.5.0";
 const OFFICIAL_COMMIT: &str = "39207d91c30899cad1e7c1b9eb678c241f678e55";
 const OFFICIAL_REPOSITORY: &str = "https://github.com/index-tts/index-tts.git";
+const RUNTIME_READY_MARKER: &str = ".aura_runtime_ready";
 const PREPARE_SCRIPT: &str = include_str!("../assets/indextts_prepare.py");
 const BRIDGE_SCRIPT: &str = include_str!("../assets/indextts_bridge.py");
 
@@ -47,13 +52,18 @@ impl IndexTtsRuntime {
     }
 
     pub fn is_ready(&self) -> bool {
-        runtime_python(&self.source_dir).is_file() && model_is_ready(&self.model_dir)
+        runtime_python(&self.source_dir).is_file()
+            && self.source_dir.join(RUNTIME_READY_MARKER).is_file()
+            && model_is_ready(&self.model_dir)
     }
 
     pub fn ensure_ready(
         &self,
         mut on_progress: impl FnMut(IndexTtsProgress),
     ) -> Result<(), String> {
+        let control = model_download_control();
+        let _download_session = control.begin();
+        control.checkpoint()?;
         std::fs::create_dir_all(
             self.source_dir
                 .parent()
@@ -81,20 +91,27 @@ impl IndexTtsRuntime {
                 OFFICIAL_REPOSITORY,
             ]);
             clone.arg(&staging);
-            run_command(&mut clone, |_| {})?;
+            run_download_command(&mut clone, control, |_| {})?;
             std::fs::rename(&staging, &self.source_dir)
                 .map_err(|error| format!("无法安装 IndexTTS 官方源码：{error}"))?;
         }
         verify_official_revision(&self.source_dir)?;
 
-        if !runtime_python(&self.source_dir).is_file() {
+        if !runtime_python(&self.source_dir).is_file()
+            || !self.source_dir.join(RUNTIME_READY_MARKER).is_file()
+        {
             require_tool("uv", &["--version"], "uv")?;
             on_progress(IndexTtsProgress::Phase(
                 "正在创建 IndexTTS-2.5 官方 Python/PyTorch 运行环境".to_owned(),
             ));
             let mut sync = Command::new("uv");
             sync.args(["sync", "--project"]).arg(&self.source_dir);
-            run_command(&mut sync, |_| {})?;
+            run_download_command(&mut sync, control, |_| {})?;
+            std::fs::write(
+                self.source_dir.join(RUNTIME_READY_MARKER),
+                format!("{OFFICIAL_COMMIT}\n"),
+            )
+            .map_err(|error| format!("无法记录 IndexTTS 运行环境状态：{error}"))?;
         }
 
         if !model_is_ready(&self.model_dir) {
@@ -103,15 +120,15 @@ impl IndexTtsRuntime {
             let prepare_path = self.source_dir.join(".aura_indextts_prepare.py");
             std::fs::write(&prepare_path, PREPARE_SCRIPT)
                 .map_err(|error| format!("无法准备 IndexTTS 下载桥接器：{error}"))?;
-            let mut prepare = Command::new("uv");
+            // Invoke the venv interpreter directly. Besides avoiding another
+            // launcher process, this gives the download controller one stable
+            // process to suspend and resume on every desktop platform.
+            let mut prepare = Command::new(runtime_python(&self.source_dir));
             prepare
-                .args(["run", "--project"])
-                .arg(&self.source_dir)
-                .arg("python")
                 .arg(&prepare_path)
                 .arg(&self.model_dir)
                 .current_dir(&self.source_dir);
-            run_command(&mut prepare, |line| {
+            run_download_command(&mut prepare, control, |line| {
                 if let Some(progress) = parse_model_progress(line) {
                     on_progress(progress);
                 }
@@ -226,6 +243,12 @@ impl IndexTtsRuntime {
     }
 }
 
+pub fn models_directory() -> Result<PathBuf, String> {
+    ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
+        .map(|project_dirs| project_dirs.cache_dir().join("indextts-2.5/models"))
+        .ok_or_else(|| "无法确定 IndexTTS-2.5 本地缓存目录。".to_owned())
+}
+
 fn runtime_python(source_dir: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
         source_dir.join(".venv/Scripts/python.exe")
@@ -306,11 +329,37 @@ fn parse_model_progress(line: &str) -> Option<IndexTtsProgress> {
 }
 
 fn run_command(command: &mut Command, mut on_line: impl FnMut(&str)) -> Result<(), String> {
+    run_command_impl(command, None, &mut on_line)
+}
+
+fn run_download_command(
+    command: &mut Command,
+    control: &DownloadControl,
+    mut on_line: impl FnMut(&str),
+) -> Result<(), String> {
+    control.checkpoint()?;
+    run_command_impl(command, Some(control), &mut on_line)
+}
+
+fn run_command_impl(
+    command: &mut Command,
+    control: Option<&DownloadControl>,
+    on_line: &mut impl FnMut(&str),
+) -> Result<(), String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    if control.is_some() {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let display = format!("{command:?}");
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动 {display}：{error}"))?;
+    let process_id = child.id();
+    if let Some(control) = control {
+        control.register_process(process_id);
+    }
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let (line_tx, line_rx) = mpsc::channel();
@@ -338,6 +387,12 @@ fn run_command(command: &mut Command, mut on_line: impl FnMut(&str)) -> Result<(
     let status = child
         .wait()
         .map_err(|error| format!("等待 {display} 完成时失败：{error}"))?;
+    if let Some(control) = control {
+        control.clear_process(process_id);
+        if control.state() == DownloadState::Cancelled {
+            return Err(DOWNLOAD_CANCELLED_ERROR.to_owned());
+        }
+    }
     if status.success() {
         Ok(())
     } else {

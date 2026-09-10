@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "../src/download_control.rs"]
+mod download_control;
 #[path = "../src/qwen_local.rs"]
 mod qwen_local;
 #[path = "../src/timeline_audio.rs"]

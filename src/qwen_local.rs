@@ -6,6 +6,8 @@ use std::{
 use directories::{BaseDirs, ProjectDirs};
 use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions, VoiceClonePrompt};
 
+use crate::download_control::{DownloadControl, model_download_control};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QwenModelKind {
     CustomVoice,
@@ -300,7 +302,11 @@ impl LocalQwenModel {
         kind: QwenModelKind,
         mut on_progress: impl FnMut(DownloadProgress),
     ) -> Result<Self, String> {
-        let model_dir = prepare_model_files(version, kind, &mut on_progress)?;
+        let control = model_download_control();
+        let model_dir = {
+            let _download_session = control.begin();
+            prepare_model_files(version, kind, control, &mut on_progress)?
+        };
         let device = qwen3_tts::auto_device()
             .map_err(|error| format!("无法初始化 Qwen3-TTS 推理设备：{error:#}"))?;
         let device_label = if device.is_metal() {
@@ -450,6 +456,7 @@ struct ModelFile {
 fn prepare_model_files(
     version: QwenModelVersion,
     kind: QwenModelKind,
+    control: &DownloadControl,
     on_progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<PathBuf, String> {
     let project_dirs = ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
@@ -500,11 +507,12 @@ fn prepare_model_files(
     ];
 
     for file in &model_files {
+        control.checkpoint()?;
         if file.label == "text-tokenizer" && has_usable_text_tokenizer(&model_dir) {
             continue;
         }
         let destination = model_dir.join(file.local_path);
-        download_file(&client, file, &destination, on_progress)?;
+        download_file(&client, file, &destination, control, on_progress)?;
     }
     validate_ready_model_dir(&model_dir, version, kind)?;
     Ok(model_dir)
@@ -836,8 +844,10 @@ fn download_file(
     client: &reqwest::blocking::Client,
     file: &ModelFile,
     destination: &Path,
+    control: &DownloadControl,
     on_progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
+    control.checkpoint()?;
     if valid_file(destination, file.minimum_size) {
         let size = std::fs::metadata(destination)
             .map(|meta| meta.len())
@@ -861,6 +871,7 @@ fn download_file(
     let mut last_error = String::new();
 
     for attempt in 1..=3 {
+        control.checkpoint()?;
         let existing_bytes = std::fs::metadata(&part_path)
             .map(|meta| meta.len())
             .unwrap_or(0);
@@ -902,6 +913,7 @@ fn download_file(
         let mut buffer = vec![0_u8; 256 * 1024];
         let mut stream_error = None;
         loop {
+            control.checkpoint()?;
             let bytes_read = match response.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(bytes_read) => bytes_read,
@@ -952,6 +964,12 @@ fn download_file(
         "下载 {} 失败（已重试 3 次）：{last_error}",
         file.label
     ))
+}
+
+pub fn models_directory() -> Result<PathBuf, String> {
+    ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
+        .map(|project_dirs| project_dirs.cache_dir().join("models"))
+        .ok_or_else(|| "无法确定 Qwen3-TTS 模型缓存目录。".to_owned())
 }
 
 fn valid_file(path: &Path, minimum_size: u64) -> bool {

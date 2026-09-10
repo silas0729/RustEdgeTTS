@@ -29,6 +29,9 @@ rwhisper = { version = "0.4.1", features = ["metal"] }
 # Qwen3-TTS runs fully locally through Candle and uses Apple Metal on macOS.
 speakers-qwen3-tts = { version = "0.3.0", default-features = false, features = ["metal"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # Candle's portable CPU backend keeps the same local transcription feature on
 # Windows and Linux without trying to compile Apple's Metal framework.

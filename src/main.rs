@@ -2,6 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 mod asr;
+mod download_control;
 mod indextts;
 mod qwen_local;
 mod subtitle_pipeline;
@@ -22,6 +24,7 @@ mod system_proxy;
 mod timeline_audio;
 
 use asr::{RecognitionLanguage, SubtitleExportFormat};
+use download_control::{DownloadState, is_download_cancelled, model_download_control};
 use indextts::{IndexTtsProgress, IndexTtsRuntime};
 use qwen_local::{
     LocalQwenModel, LocalVoiceClonePrompt, QwenModelKind, QwenModelVersion, QwenSynthesisLanguage,
@@ -201,6 +204,19 @@ enum TtsEngine {
     Edge,
     Qwen3Local,
     IndexTts25,
+}
+
+#[derive(Clone, Copy)]
+enum ModelDirectoryKind {
+    Qwen3,
+    IndexTts25,
+}
+
+#[derive(Clone, Copy)]
+enum ModelDownloadAction {
+    Pause,
+    Resume,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1009,11 +1025,19 @@ impl TtsApp {
                 WorkerEvent::IndexTtsFailed(error) => {
                     self.indextts_model_preparing = false;
                     self.indextts_model_progress = None;
-                    self.status = Some(StatusMessage::new(
-                        StatusKind::Error,
-                        format!("IndexTTS-2.5 准备失败：{error}"),
-                        format!("IndexTTS-2.5 setup failed: {error}"),
-                    ));
+                    self.status = Some(if is_download_cancelled(&error) {
+                        StatusMessage::new(
+                            StatusKind::Info,
+                            "IndexTTS-2.5 下载已取消，临时文件已保留；再次点击“准备模型”即可续传。",
+                            "IndexTTS-2.5 download cancelled. Partial files were kept; select Prepare model to resume.",
+                        )
+                    } else {
+                        StatusMessage::new(
+                            StatusKind::Error,
+                            format!("IndexTTS-2.5 准备失败：{error}"),
+                            format!("IndexTTS-2.5 setup failed: {error}"),
+                        )
+                    });
                 }
                 WorkerEvent::IndexTtsInferencePhase(phase) => {
                     self.status = Some(StatusMessage::new(
@@ -1031,7 +1055,11 @@ impl TtsApp {
                     ));
                 }
                 WorkerEvent::PreviewFailed(error) => {
-                    if self.qwen_model_preparing && self.tts_engine == TtsEngine::Qwen3Local {
+                    let download_cancelled = is_download_cancelled(&error);
+                    if !download_cancelled
+                        && self.qwen_model_preparing
+                        && self.tts_engine == TtsEngine::Qwen3Local
+                    {
                         self.qwen_manual_help_open = true;
                     }
                     self.qwen_model_preparing = false;
@@ -1039,11 +1067,15 @@ impl TtsApp {
                     self.indextts_model_preparing = false;
                     self.indextts_model_progress = None;
                     self.previewing = false;
-                    self.status = Some(StatusMessage::new(
-                        StatusKind::Error,
-                        format!("试听失败：{error}"),
-                        format!("Preview failed: {error}"),
-                    ));
+                    self.status = Some(if download_cancelled {
+                        cancelled_download_status()
+                    } else {
+                        StatusMessage::new(
+                            StatusKind::Error,
+                            format!("试听失败：{error}"),
+                            format!("Preview failed: {error}"),
+                        )
+                    });
                 }
                 WorkerEvent::GenerationFinished {
                     output_path,
@@ -1231,7 +1263,11 @@ impl TtsApp {
                     ));
                 }
                 WorkerEvent::GenerationFailed(error) => {
-                    if self.qwen_model_preparing && self.tts_engine == TtsEngine::Qwen3Local {
+                    let download_cancelled = is_download_cancelled(&error);
+                    if !download_cancelled
+                        && self.qwen_model_preparing
+                        && self.tts_engine == TtsEngine::Qwen3Local
+                    {
                         self.qwen_manual_help_open = true;
                     }
                     self.qwen_model_preparing = false;
@@ -1240,11 +1276,15 @@ impl TtsApp {
                     self.indextts_model_progress = None;
                     self.generating = false;
                     self.subtitle_progress = None;
-                    self.status = Some(StatusMessage::new(
-                        StatusKind::Error,
-                        format!("生成语音失败：{error}"),
-                        error,
-                    ));
+                    self.status = Some(if download_cancelled {
+                        cancelled_download_status()
+                    } else {
+                        StatusMessage::new(
+                            StatusKind::Error,
+                            format!("生成语音失败：{error}"),
+                            error,
+                        )
+                    });
                 }
                 WorkerEvent::WorkerFailed(error) => {
                     self.fetching_voices = false;
@@ -1373,6 +1413,122 @@ impl TtsApp {
                     "The background worker stopped. Restart the app.",
                 ));
             }
+        }
+    }
+
+    fn open_model_directory(&mut self, kind: ModelDirectoryKind) {
+        let directory = match kind {
+            ModelDirectoryKind::Qwen3 => qwen_local::models_directory(),
+            ModelDirectoryKind::IndexTts25 => indextts::models_directory(),
+        };
+        let result = directory.and_then(|directory| {
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("无法创建模型目录：{error}"))?;
+            open_directory_in_file_manager(&directory)?;
+            Ok(directory)
+        });
+        match result {
+            Ok(directory) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Success,
+                    format!("已打开本地模型目录：{}", directory.display()),
+                    format!("Opened the local model folder: {}", directory.display()),
+                ));
+            }
+            Err(error) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    format!("无法打开本地模型目录：{error}"),
+                    format!("Could not open the local model folder: {error}"),
+                ));
+            }
+        }
+    }
+
+    fn apply_model_download_action(&mut self, action: ModelDownloadAction) {
+        let control = model_download_control();
+        let changed = match action {
+            ModelDownloadAction::Pause => control.pause(),
+            ModelDownloadAction::Resume => control.resume(),
+            ModelDownloadAction::Cancel => control.cancel(),
+        };
+        if !changed {
+            return;
+        }
+        self.status = Some(match action {
+            ModelDownloadAction::Pause => StatusMessage::new(
+                StatusKind::Info,
+                "模型下载已暂停。点击“继续”可从当前进度恢复。",
+                "Model download paused. Select Resume to continue from the current progress.",
+            ),
+            ModelDownloadAction::Resume => StatusMessage::new(
+                StatusKind::Info,
+                "正在从已有进度继续下载模型…",
+                "Resuming the model download from its existing progress…",
+            ),
+            ModelDownloadAction::Cancel => StatusMessage::new(
+                StatusKind::Info,
+                "正在取消模型下载；已下载的临时文件会保留，以便下次继续。",
+                "Cancelling the model download. Partial files will be kept for a later resume.",
+            ),
+        });
+    }
+
+    fn show_model_download_actions(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        let state = model_download_control().state();
+        if matches!(state, DownloadState::Idle) {
+            return;
+        }
+        let mut action = None;
+        ui.horizontal(|ui| {
+            match state {
+                DownloadState::Running => {
+                    if ui
+                        .add(model_action_button(
+                            language.text("暂停下载", "Pause download"),
+                        ))
+                        .clicked()
+                    {
+                        action = Some(ModelDownloadAction::Pause);
+                    }
+                }
+                DownloadState::Paused => {
+                    ui.label(
+                        egui::RichText::new(language.text("下载已暂停", "Download paused"))
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                    );
+                    if ui
+                        .add(model_action_button(
+                            language.text("继续下载", "Resume download"),
+                        ))
+                        .clicked()
+                    {
+                        action = Some(ModelDownloadAction::Resume);
+                    }
+                }
+                DownloadState::Cancelled => {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new(language.text("正在取消…", "Cancelling…"))
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                    );
+                }
+                DownloadState::Idle => {}
+            }
+            if !matches!(state, DownloadState::Cancelled)
+                && ui
+                    .add(model_action_button(
+                        language.text("取消下载", "Cancel download"),
+                    ))
+                    .clicked()
+            {
+                action = Some(ModelDownloadAction::Cancel);
+            }
+        });
+        if let Some(action) = action {
+            self.apply_model_download_action(action);
         }
     }
 
@@ -2649,8 +2805,17 @@ impl TtsApp {
                         UiLanguage::Chinese => 96.0,
                         UiLanguage::English => 104.0,
                     };
-                    let summary_width =
-                        (ui.available_width() - import_width - 30.0 - gap * 2.0).max(100.0);
+                    let directory_width = if language == UiLanguage::Chinese {
+                        76.0
+                    } else {
+                        94.0
+                    };
+                    let summary_width = (ui.available_width()
+                        - import_width
+                        - directory_width
+                        - 30.0
+                        - gap * 3.0)
+                        .max(100.0);
                     ui.add_sized(
                         egui::vec2(summary_width, layout.metadata_height),
                         egui::Label::new(
@@ -2661,6 +2826,12 @@ impl TtsApp {
                         .truncate(),
                     )
                     .on_hover_text(&summary);
+                    if ui
+                        .add(model_directory_button(language, directory_width))
+                        .clicked()
+                    {
+                        self.open_model_directory(ModelDirectoryKind::Qwen3);
+                    }
                     if ui
                         .add(
                             egui::Button::new(
@@ -2699,16 +2870,17 @@ impl TtsApp {
                 if self.qwen_model_preparing
                     && let Some(progress) = self.qwen_model_progress
                 {
-                    ui.add(
-                        egui::ProgressBar::new(progress)
-                            .desired_width(ui.available_width())
-                            .show_percentage()
-                            .text(format!(
-                                "{} · {}",
-                                language.text("本地模型", "Local model"),
-                                self.qwen_model_progress_label
-                            )),
-                    );
+                    ui.add(model_download_progress_bar(
+                        progress,
+                        format!(
+                            "{} · {}",
+                            language.text("本地模型", "Local model"),
+                            self.qwen_model_progress_label
+                        ),
+                    ));
+                }
+                if self.qwen_model_preparing {
+                    self.show_model_download_actions(ui, language);
                 }
             } else {
                 ui.label(
@@ -2959,15 +3131,22 @@ impl TtsApp {
                 language.text("待下载", "not downloaded")
             };
             ui.horizontal(|ui| {
+                let gap = ui.spacing().item_spacing.x;
                 let button_width = if language == UiLanguage::Chinese {
                     104.0
                 } else {
                     116.0
                 };
+                let directory_width = if language == UiLanguage::Chinese {
+                    76.0
+                } else {
+                    94.0
+                };
                 let summary = format!("IndexTTS-2.5 · v2.5.0 · {state}");
                 ui.add_sized(
                     egui::vec2(
-                        (ui.available_width() - button_width - 8.0).max(80.0),
+                        (ui.available_width() - button_width - directory_width - gap * 2.0)
+                            .max(80.0),
                         layout.metadata_height,
                     ),
                     egui::Label::new(
@@ -2981,6 +3160,12 @@ impl TtsApp {
                     "固定使用官方 v2.5.0；首次准备需要 Git、uv 和网络",
                     "Pinned to official v2.5.0; first setup needs Git, uv, and internet",
                 ));
+                if ui
+                    .add(model_directory_button(language, directory_width))
+                    .clicked()
+                {
+                    self.open_model_directory(ModelDirectoryKind::IndexTts25);
+                }
                 let prepare = egui::Button::new(
                     egui::RichText::new(if self.indextts_model_ready {
                         language.text("检查模型", "Check model")
@@ -2996,7 +3181,7 @@ impl TtsApp {
                     1.0,
                     egui::Color32::from_rgb(205, 214, 255),
                 ))
-                .corner_radius(8)
+                .corner_radius(5)
                 .min_size(egui::vec2(button_width, layout.metadata_height));
                 if ui.add_enabled(!busy, prepare).clicked() {
                     self.prepare_indextts_model();
@@ -3004,12 +3189,10 @@ impl TtsApp {
             });
             if self.indextts_model_preparing {
                 if let Some(progress) = self.indextts_model_progress {
-                    ui.add(
-                        egui::ProgressBar::new(progress)
-                            .desired_width(ui.available_width())
-                            .show_percentage()
-                            .text(self.indextts_model_progress_label.clone()),
-                    );
+                    ui.add(model_download_progress_bar(
+                        progress,
+                        self.indextts_model_progress_label.clone(),
+                    ));
                 } else {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -3020,6 +3203,7 @@ impl TtsApp {
                         );
                     });
                 }
+                self.show_model_download_actions(ui, language);
             }
             return;
         }
@@ -3059,7 +3243,14 @@ impl TtsApp {
             } else {
                 104.0
             };
-            let summary_width = (ui.available_width() - import_width - 30.0 - gap * 2.0).max(80.0);
+            let directory_width = if language == UiLanguage::Chinese {
+                76.0
+            } else {
+                94.0
+            };
+            let summary_width =
+                (ui.available_width() - import_width - directory_width - 30.0 - gap * 3.0)
+                    .max(80.0);
             ui.add_sized(
                 egui::vec2(summary_width, layout.metadata_height),
                 egui::Label::new(
@@ -3073,6 +3264,12 @@ impl TtsApp {
                 "参考音频、原文、克隆提示和模型均只保留在本机",
                 "Reference audio, text, clone prompt, and model stay on this device",
             ));
+            if ui
+                .add(model_directory_button(language, directory_width))
+                .clicked()
+            {
+                self.open_model_directory(ModelDirectoryKind::Qwen3);
+            }
             if ui
                 .add(
                     egui::Button::new(egui::RichText::new("?").size(12.0).strong().color(PRIMARY))
@@ -3109,16 +3306,17 @@ impl TtsApp {
         if self.qwen_model_preparing
             && let Some(progress) = self.qwen_model_progress
         {
-            ui.add(
-                egui::ProgressBar::new(progress)
-                    .desired_width(ui.available_width())
-                    .show_percentage()
-                    .text(format!(
-                        "{} · {}",
-                        language.text("本地模型", "Local model"),
-                        self.qwen_model_progress_label
-                    )),
-            );
+            ui.add(model_download_progress_bar(
+                progress,
+                format!(
+                    "{} · {}",
+                    language.text("本地模型", "Local model"),
+                    self.qwen_model_progress_label
+                ),
+            ));
+        }
+        if self.qwen_model_preparing {
+            self.show_model_download_actions(ui, language);
         }
     }
 
@@ -4065,6 +4263,68 @@ fn secondary_action_button(label: &str, width: f32) -> egui::Button<'_> {
     ))
     .corner_radius(8)
     .min_size(egui::vec2(width, 34.0))
+}
+
+fn model_directory_button(language: UiLanguage, width: f32) -> egui::Button<'static> {
+    let label = match language {
+        UiLanguage::Chinese => "打开目录",
+        UiLanguage::English => "Open folder",
+    };
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(11.0)
+            .strong()
+            .color(TEXT_PRIMARY),
+    )
+    .fill(EDITOR_BACKGROUND)
+    .stroke(egui::Stroke::new(1.0, BORDER))
+    .corner_radius(5)
+    .min_size(egui::vec2(width, 28.0))
+}
+
+fn model_action_button(label: &str) -> egui::Button<'_> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(11.0)
+            .strong()
+            .color(PRIMARY),
+    )
+    .fill(PRIMARY_SOFT)
+    .stroke(egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgb(205, 214, 255),
+    ))
+    .corner_radius(5)
+    .min_size(egui::vec2(72.0, 26.0))
+}
+
+fn model_download_progress_bar(progress: f32, label: impl Into<String>) -> egui::ProgressBar {
+    let progress = progress.clamp(0.0, 1.0);
+    egui::ProgressBar::new(progress)
+        .desired_height(20.0)
+        .corner_radius(4)
+        .text(format!("{} · {:.1}%", label.into(), progress * 100.0))
+}
+
+fn cancelled_download_status() -> StatusMessage {
+    StatusMessage::new(
+        StatusKind::Info,
+        "模型下载已取消，临时文件已保留；再次开始时会从已有进度继续。",
+        "Model download cancelled. Partial files were kept and will be resumed next time.",
+    )
+}
+
+fn open_directory_in_file_manager(directory: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let result = Command::new("/usr/bin/open").arg(directory).spawn();
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer").arg(directory).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result = Command::new("xdg-open").arg(directory).spawn();
+
+    result
+        .map(|_| ())
+        .map_err(|error| format!("{}（{}）", directory.display(), error))
 }
 
 fn configure_voice_combo_style(ui: &mut egui::Ui) {

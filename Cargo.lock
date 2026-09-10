@@ -1362,6 +1362,7 @@ dependencies = [
  "eframe",
  "encoding_rs",
  "futures-util",
+ "libc",
  "proxy_cfg",
  "reqwest 0.12.28",
  "rfd",
