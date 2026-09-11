@@ -300,13 +300,43 @@ impl LocalQwenModel {
     pub fn load(
         version: QwenModelVersion,
         kind: QwenModelKind,
+        on_progress: impl FnMut(DownloadProgress),
+    ) -> Result<Self, String> {
+        Self::load_internal(version, kind, true, on_progress)
+    }
+
+    pub fn redownload(
+        version: QwenModelVersion,
+        kind: QwenModelKind,
+        on_progress: impl FnMut(DownloadProgress),
+    ) -> Result<Self, String> {
+        let model_dir = model_directory(version, kind)?;
+        if model_dir.exists() {
+            std::fs::remove_dir_all(&model_dir)
+                .map_err(|error| format!("无法清理所选 Qwen3-TTS 模型缓存：{error}"))?;
+        }
+        Self::load_internal(version, kind, false, on_progress)
+    }
+
+    fn load_internal(
+        version: QwenModelVersion,
+        kind: QwenModelKind,
+        reuse_existing: bool,
         mut on_progress: impl FnMut(DownloadProgress),
     ) -> Result<Self, String> {
         let control = model_download_control();
         let model_dir = {
             let _download_session = control.begin();
-            prepare_model_files(version, kind, control, &mut on_progress)?
+            prepare_model_files(version, kind, reuse_existing, control, &mut on_progress)?
         };
+        // Downloading and loading are separate phases. Report the latter as an
+        // indeterminate step so the UI does not leave a completed 100% download
+        // bar on screen while Candle is still mapping the model weights.
+        on_progress(DownloadProgress {
+            file: "model-loading",
+            downloaded_bytes: 0,
+            total_bytes: 0,
+        });
         let device = qwen3_tts::auto_device()
             .map_err(|error| format!("无法初始化 Qwen3-TTS 推理设备：{error:#}"))?;
         let device_label = if device.is_metal() {
@@ -456,6 +486,7 @@ struct ModelFile {
 fn prepare_model_files(
     version: QwenModelVersion,
     kind: QwenModelKind,
+    reuse_existing: bool,
     control: &DownloadControl,
     on_progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<PathBuf, String> {
@@ -466,8 +497,10 @@ fn prepare_model_files(
     std::fs::create_dir_all(&model_dir)
         .map_err(|error| format!("无法创建 Qwen3-TTS 模型缓存目录：{error}"))?;
 
-    reuse_hugging_face_main_model(&model_dir, version, kind);
-    reuse_shared_assets(&models_dir, &model_dir, version, kind);
+    if reuse_existing {
+        reuse_hugging_face_main_model(&model_dir, version, kind);
+        reuse_shared_assets(&models_dir, &model_dir, version, kind);
+    }
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(30 * 60))
@@ -970,6 +1003,10 @@ pub fn models_directory() -> Result<PathBuf, String> {
     ProjectDirs::from("com", "Aura Labs", "Edge TTS Studio")
         .map(|project_dirs| project_dirs.cache_dir().join("models"))
         .ok_or_else(|| "无法确定 Qwen3-TTS 模型缓存目录。".to_owned())
+}
+
+fn model_directory(version: QwenModelVersion, kind: QwenModelKind) -> Result<PathBuf, String> {
+    Ok(models_directory()?.join(version.cache_folder(kind)))
 }
 
 fn valid_file(path: &Path, minimum_size: u64) -> bool {

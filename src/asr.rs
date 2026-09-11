@@ -34,6 +34,15 @@ const MIN_SENTENCE_CUE_MS: u64 = 700;
 const WHISPER_SAMPLE_RATE: u64 = 16_000;
 const BUNDLED_MODEL_CONFIG: &str = include_str!("../assets/whisper-large-v3-turbo-config.json");
 
+pub fn model_directory() -> Result<PathBuf, String> {
+    BaseDirs::new()
+        .map(|dirs| {
+            dirs.data_dir()
+                .join("kalosm/cache/Demonthos/candle-quantized-whisper-large-v3-turbo/main")
+        })
+        .ok_or_else(|| "Could not determine the local Whisper model directory.".to_owned())
+}
+
 #[derive(Debug)]
 struct TimedChunk {
     start_ms: u64,
@@ -107,17 +116,11 @@ pub async fn load_model(
 }
 
 async fn ensure_model_config() -> Result<(), String> {
-    let path = BaseDirs::new()
-        .map(|dirs| {
-            dirs.data_dir().join(
-                "kalosm/cache/Demonthos/candle-quantized-whisper-large-v3-turbo/main/config.json",
-            )
+    let path = model_directory()
+        .unwrap_or_else(|_| {
+            PathBuf::from("kalosm/cache/Demonthos/candle-quantized-whisper-large-v3-turbo/main")
         })
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                "kalosm/cache/Demonthos/candle-quantized-whisper-large-v3-turbo/main/config.json",
-            )
-        });
+        .join("config.json");
     if path.is_file() {
         return Ok(());
     }

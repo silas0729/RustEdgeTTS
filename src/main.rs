@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 mod asr;
+mod audio_player;
 mod download_control;
 mod indextts;
 mod qwen_local;
@@ -24,6 +25,7 @@ mod system_proxy;
 mod timeline_audio;
 
 use asr::{RecognitionLanguage, SubtitleExportFormat};
+use audio_player::GeneratedAudioPlayer;
 use download_control::{DownloadState, is_download_cancelled, model_download_control};
 use indextts::{IndexTtsProgress, IndexTtsRuntime};
 use qwen_local::{
@@ -88,6 +90,14 @@ enum WorkerCommand {
         kind: QwenModelKind,
         source_dir: PathBuf,
     },
+    PrepareQwenModel {
+        version: QwenModelVersion,
+        kind: QwenModelKind,
+    },
+    RedownloadQwenModel {
+        version: QwenModelVersion,
+        kind: QwenModelKind,
+    },
     PrepareIndexTts,
     TranscribeMedia {
         input_path: PathBuf,
@@ -97,6 +107,9 @@ enum WorkerCommand {
         output_path: PathBuf,
         cues: Vec<SubtitleCue>,
         format: SubtitleExportFormat,
+    },
+    LoadGeneratedAudio {
+        input_path: PathBuf,
     },
 }
 
@@ -124,6 +137,7 @@ enum WorkerEvent {
         kind: QwenModelKind,
         device: String,
     },
+    QwenModelFailed(String),
     QwenModelImportProgress {
         version: QwenModelVersion,
         kind: QwenModelKind,
@@ -178,6 +192,9 @@ enum WorkerEvent {
         total_bytes: u64,
     },
     AsrModelReady,
+    AsrModelLoading {
+        progress: f32,
+    },
     TranscriptionProgress {
         progress: f32,
         remaining_seconds: u64,
@@ -189,6 +206,15 @@ enum WorkerEvent {
     TranscriptionSaved(PathBuf),
     TranscriptionSaveFailed(String),
     TranscriptionFailed(String),
+    GeneratedAudioLoaded {
+        input_path: PathBuf,
+        samples: Vec<f32>,
+        sample_rate: u32,
+    },
+    GeneratedAudioLoadFailed {
+        input_path: PathBuf,
+        error: String,
+    },
     GenerationFailed(String),
     WorkerFailed(String),
 }
@@ -210,6 +236,7 @@ enum TtsEngine {
 enum ModelDirectoryKind {
     Qwen3,
     IndexTts25,
+    Whisper,
 }
 
 #[derive(Clone, Copy)]
@@ -634,6 +661,8 @@ struct TtsApp {
     previewing: bool,
     generating: bool,
     last_generated_audio: Option<PathBuf>,
+    generated_audio_player: Option<GeneratedAudioPlayer>,
+    generated_audio_loading: bool,
     asr_input_path: Option<PathBuf>,
     recognition_language: RecognitionLanguage,
     subtitle_export_format: SubtitleExportFormat,
@@ -714,6 +743,8 @@ impl TtsApp {
             previewing: false,
             generating: false,
             last_generated_audio: None,
+            generated_audio_player: None,
+            generated_audio_loading: false,
             asr_input_path: None,
             recognition_language: RecognitionLanguage::MixedChineseEnglish,
             subtitle_export_format: SubtitleExportFormat::Srt,
@@ -822,6 +853,27 @@ impl TtsApp {
                     total_bytes,
                 } => {
                     self.qwen_model_preparing = true;
+                    if file == "model-loading" {
+                        self.qwen_model_progress = None;
+                        self.qwen_model_progress_label = self
+                            .ui_language
+                            .text("正在载入 Qwen3 模型", "Loading the Qwen3 model")
+                            .to_owned();
+                        self.status = Some(StatusMessage::new(
+                            StatusKind::Info,
+                            format!(
+                                "Qwen3-TTS {} {} 已下载，正在载入本地推理设备…",
+                                version.short_label(),
+                                kind.short_label()
+                            ),
+                            format!(
+                                "Qwen3-TTS {} {} is downloaded and loading onto the local device…",
+                                version.short_label(),
+                                kind.short_label()
+                            ),
+                        ));
+                        continue;
+                    }
                     let localized_file = match file.as_str() {
                         "main-model" => ("Qwen3 主模型", "Qwen3 main model"),
                         "model-config" => ("Qwen3 配置", "Qwen3 configuration"),
@@ -858,19 +910,50 @@ impl TtsApp {
                     self.qwen_model_progress = None;
                     self.qwen_model_ready = Some((version, kind));
                     self.qwen_device = Some(device.clone());
-                    self.status = Some(StatusMessage::new(
-                        StatusKind::Info,
-                        format!(
-                            "Qwen3-TTS {} {} 已就绪，正在使用 {device} 本地生成…",
-                            version.short_label(),
-                            kind.short_label()
-                        ),
-                        format!(
-                            "Qwen3-TTS {} {} is ready. Generating locally with {device}…",
-                            version.short_label(),
-                            kind.short_label()
-                        ),
-                    ));
+                    self.status = Some(if self.generating || self.previewing {
+                        StatusMessage::new(
+                            StatusKind::Info,
+                            format!(
+                                "Qwen3-TTS {} {} 已就绪，正在使用 {device} 本地生成…",
+                                version.short_label(),
+                                kind.short_label()
+                            ),
+                            format!(
+                                "Qwen3-TTS {} {} is ready. Generating locally with {device}…",
+                                version.short_label(),
+                                kind.short_label()
+                            ),
+                        )
+                    } else {
+                        StatusMessage::new(
+                            StatusKind::Success,
+                            format!(
+                                "Qwen3-TTS {} {} 已下载并载入（{device}）。",
+                                version.short_label(),
+                                kind.short_label()
+                            ),
+                            format!(
+                                "Qwen3-TTS {} {} is downloaded and loaded on {device}.",
+                                version.short_label(),
+                                kind.short_label()
+                            ),
+                        )
+                    });
+                }
+                WorkerEvent::QwenModelFailed(error) => {
+                    self.qwen_model_preparing = false;
+                    self.qwen_model_progress = None;
+                    self.qwen_model_ready = None;
+                    self.qwen_device = None;
+                    self.status = Some(if is_download_cancelled(&error) {
+                        cancelled_download_status()
+                    } else {
+                        StatusMessage::new(
+                            StatusKind::Error,
+                            format!("Qwen3-TTS 模型准备失败：{error}"),
+                            format!("Qwen3-TTS model setup failed: {error}"),
+                        )
+                    });
                 }
                 WorkerEvent::QwenModelImportProgress {
                     version,
@@ -1097,6 +1180,7 @@ impl TtsApp {
                             output_path.display()
                         ),
                     ));
+                    self.prepare_generated_audio_player(output_path);
                 }
                 WorkerEvent::SubtitleProgress { current, total } => {
                     self.subtitle_progress = Some((current, total));
@@ -1148,6 +1232,7 @@ impl TtsApp {
                             )
                         },
                     ));
+                    self.prepare_generated_audio_player(output_path);
                 }
                 WorkerEvent::AsrModelProgress {
                     source,
@@ -1161,19 +1246,16 @@ impl TtsApp {
                         0.0
                     };
                     self.transcription_progress = progress.clamp(0.0, 1.0);
+                    let transfer = format_transfer_progress(downloaded_bytes, total_bytes);
                     self.status = Some(StatusMessage::new(
                         StatusKind::Info,
                         format!(
-                            "正在准备本地模型：{}（{:.1}/{:.1} MB）",
+                            "正在准备本地模型：{} · {transfer}",
                             compact_model_source(&source),
-                            downloaded_bytes as f64 / 1_048_576.0,
-                            total_bytes as f64 / 1_048_576.0
                         ),
                         format!(
-                            "Preparing local model: {} ({:.1}/{:.1} MB)",
+                            "Preparing local model: {} · {transfer}",
                             compact_model_source(&source),
-                            downloaded_bytes as f64 / 1_048_576.0,
-                            total_bytes as f64 / 1_048_576.0
                         ),
                     ));
                 }
@@ -1184,6 +1266,21 @@ impl TtsApp {
                         StatusKind::Info,
                         "模型文件已就绪，正在进行本地语音识别…",
                         "Model files are ready. Running local speech recognition…",
+                    ));
+                }
+                WorkerEvent::AsrModelLoading { progress } => {
+                    self.loading_asr_model = true;
+                    self.transcription_progress = progress.clamp(0.0, 1.0);
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        format!(
+                            "正在将 Whisper 模型载入本地设备… {:.0}%",
+                            self.transcription_progress * 100.0
+                        ),
+                        format!(
+                            "Loading Whisper onto the local device… {:.0}%",
+                            self.transcription_progress * 100.0
+                        ),
                     ));
                 }
                 WorkerEvent::TranscriptionProgress {
@@ -1261,6 +1358,39 @@ impl TtsApp {
                         format!("生成字幕失败：{}", localized_transcription_error(&error)),
                         format!("Subtitle generation failed: {error}"),
                     ));
+                }
+                WorkerEvent::GeneratedAudioLoaded {
+                    input_path,
+                    samples,
+                    sample_rate,
+                } => {
+                    if self.last_generated_audio.as_ref() == Some(&input_path) {
+                        self.generated_audio_loading = false;
+                        match GeneratedAudioPlayer::new(input_path, samples, sample_rate) {
+                            Ok(player) => self.generated_audio_player = Some(player),
+                            Err(error) => {
+                                self.generated_audio_player = None;
+                                self.status = Some(StatusMessage::new(
+                                    StatusKind::Warning,
+                                    format!("音频已生成，但无法初始化预览播放器：{error}"),
+                                    format!(
+                                        "Audio was generated, but the preview player could not start: {error}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                WorkerEvent::GeneratedAudioLoadFailed { input_path, error } => {
+                    if self.last_generated_audio.as_ref() == Some(&input_path) {
+                        self.generated_audio_loading = false;
+                        self.generated_audio_player = None;
+                        self.status = Some(StatusMessage::new(
+                            StatusKind::Warning,
+                            format!("音频已生成，但无法载入预览：{error}"),
+                            format!("Audio was generated, but its preview could not load: {error}"),
+                        ));
+                    }
                 }
                 WorkerEvent::GenerationFailed(error) => {
                     let download_cancelled = is_download_cancelled(&error);
@@ -1420,6 +1550,7 @@ impl TtsApp {
         let directory = match kind {
             ModelDirectoryKind::Qwen3 => qwen_local::models_directory(),
             ModelDirectoryKind::IndexTts25 => indextts::models_directory(),
+            ModelDirectoryKind::Whisper => asr::model_directory(),
         };
         let result = directory.and_then(|directory| {
             std::fs::create_dir_all(&directory)
@@ -1442,6 +1573,114 @@ impl TtsApp {
                     format!("Could not open the local model folder: {error}"),
                 ));
             }
+        }
+    }
+
+    fn redownload_selected_qwen_model(&mut self) {
+        if self.tts_engine != TtsEngine::Qwen3Local || self.tts_controls_busy() {
+            return;
+        }
+        let version = self.selected_qwen_version;
+        let kind = self.selected_qwen_kind();
+        match self
+            .command_tx
+            .send(WorkerCommand::RedownloadQwenModel { version, kind })
+        {
+            Ok(()) => {
+                self.qwen_model_preparing = true;
+                self.qwen_model_progress = Some(0.0);
+                self.qwen_model_progress_label = self
+                    .ui_language
+                    .text("正在清理所选模型缓存", "Clearing the selected model cache")
+                    .to_owned();
+                self.qwen_model_ready = None;
+                self.qwen_device = None;
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Info,
+                    format!(
+                        "正在重新下载 Qwen3-TTS {} {}…",
+                        version.short_label(),
+                        kind.short_label()
+                    ),
+                    format!(
+                        "Downloading Qwen3-TTS {} {} again…",
+                        version.short_label(),
+                        kind.short_label()
+                    ),
+                ));
+            }
+            Err(_) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "后台服务已停止，请重新启动应用。",
+                    "The background worker stopped. Restart the app.",
+                ));
+            }
+        }
+    }
+
+    fn prepare_selected_qwen_model(&mut self) {
+        if self.tts_engine != TtsEngine::Qwen3Local || self.tts_controls_busy() {
+            return;
+        }
+        let version = self.selected_qwen_version;
+        let kind = self.selected_qwen_kind();
+        match self
+            .command_tx
+            .send(WorkerCommand::PrepareQwenModel { version, kind })
+        {
+            Ok(()) => {
+                self.qwen_model_preparing = true;
+                self.qwen_model_progress = Some(0.0);
+                self.qwen_model_progress_label = self
+                    .ui_language
+                    .text("正在检查断点文件", "Checking partial downloads")
+                    .to_owned();
+                self.qwen_model_ready = None;
+                self.qwen_device = None;
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Info,
+                    format!(
+                        "正在下载或续传 Qwen3-TTS {} {}…",
+                        version.short_label(),
+                        kind.short_label()
+                    ),
+                    format!(
+                        "Downloading or resuming Qwen3-TTS {} {}…",
+                        version.short_label(),
+                        kind.short_label()
+                    ),
+                ));
+            }
+            Err(_) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "后台服务已停止，请重新启动应用。",
+                    "The background worker stopped. Restart the app.",
+                ));
+            }
+        }
+    }
+
+    fn prepare_generated_audio_player(&mut self, input_path: PathBuf) {
+        self.generated_audio_player = None;
+        self.generated_audio_loading = true;
+        if self
+            .command_tx
+            .send(WorkerCommand::LoadGeneratedAudio {
+                input_path: input_path.clone(),
+            })
+            .is_err()
+        {
+            self.generated_audio_loading = false;
+            self.status = Some(StatusMessage::new(
+                StatusKind::Warning,
+                format!("音频已生成，但无法载入预览：{}", input_path.display()),
+                format!(
+                    "Audio was generated, but its preview could not be loaded: {}",
+                    input_path.display()
+                ),
+            ));
         }
     }
 
@@ -1638,6 +1877,8 @@ impl TtsApp {
         match self.command_tx.send(command) {
             Ok(()) => {
                 self.generating = true;
+                self.generated_audio_player = None;
+                self.generated_audio_loading = false;
                 self.subtitle_progress = match &self.subtitle_track {
                     Some(track) if self.input_mode == InputMode::Subtitles => {
                         Some((0, track.cues.len()))
@@ -2099,6 +2340,11 @@ impl eframe::App for TtsApp {
             || self.saving_transcription
             || self.qwen_model_preparing
             || self.indextts_model_preparing
+            || self.generated_audio_loading
+            || self
+                .generated_audio_player
+                .as_ref()
+                .is_some_and(GeneratedAudioPlayer::is_playing)
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -2124,7 +2370,32 @@ impl eframe::App for TtsApp {
                         // was too small once a success message wrapped, pushing
                         // the action row below the macOS window edge.
                         let footer_height = match self.workspace_mode {
+                            WorkspaceMode::TextToSpeech
+                                if self.generating
+                                    || self.qwen_model_preparing
+                                    || self.indextts_model_preparing =>
+                            {
+                                168.0
+                            }
+                            WorkspaceMode::TextToSpeech
+                                if self.generated_audio_loading
+                                    || self.generated_audio_player.is_some() =>
+                            {
+                                154.0
+                            }
+                            WorkspaceMode::TextToSpeech
+                                if self.previewing
+                                    || (self.tts_engine == TtsEngine::Edge
+                                        && self.fetching_voices) =>
+                            {
+                                134.0
+                            }
                             WorkspaceMode::TextToSpeech => 98.0,
+                            WorkspaceMode::AudioToSubtitles
+                                if self.transcribing || self.saving_transcription =>
+                            {
+                                148.0
+                            }
                             WorkspaceMode::AudioToSubtitles => 118.0,
                         };
                         let visible_height = (ui.clip_rect().bottom() - ui.cursor().min.y).max(0.0);
@@ -2808,14 +3079,22 @@ impl TtsApp {
                     let directory_width = if language == UiLanguage::Chinese {
                         76.0
                     } else {
-                        94.0
+                        82.0
                     };
+                    let download_width = if language == UiLanguage::Chinese {
+                        72.0
+                    } else {
+                        78.0
+                    };
+                    let selected_model_ready = self.qwen_model_ready
+                        == Some((self.selected_qwen_version, QwenModelKind::CustomVoice));
                     let summary_width = (ui.available_width()
                         - import_width
                         - directory_width
+                        - download_width
                         - 30.0
-                        - gap * 3.0)
-                        .max(100.0);
+                        - gap * 4.0)
+                        .max(8.0);
                     ui.add_sized(
                         egui::vec2(summary_width, layout.metadata_height),
                         egui::Label::new(
@@ -2831,6 +3110,35 @@ impl TtsApp {
                         .clicked()
                     {
                         self.open_model_directory(ModelDirectoryKind::Qwen3);
+                    }
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            model_download_entry_button(
+                                language,
+                                selected_model_ready,
+                                download_width,
+                                layout.metadata_height,
+                            ),
+                        )
+                        .on_hover_text(if selected_model_ready {
+                            language.text(
+                                "删除所选模型缓存并重新下载",
+                                "Delete and download the selected model again",
+                            )
+                        } else {
+                            language.text(
+                                "下载模型；存在断点文件时从已有进度继续",
+                                "Download the model, resuming any partial files",
+                            )
+                        })
+                        .clicked()
+                    {
+                        if selected_model_ready {
+                            self.redownload_selected_qwen_model();
+                        } else {
+                            self.prepare_selected_qwen_model();
+                        }
                     }
                     if ui
                         .add(
@@ -2878,9 +3186,6 @@ impl TtsApp {
                             self.qwen_model_progress_label
                         ),
                     ));
-                }
-                if self.qwen_model_preparing {
-                    self.show_model_download_actions(ui, language);
                 }
             } else {
                 ui.label(
@@ -3203,7 +3508,6 @@ impl TtsApp {
                         );
                     });
                 }
-                self.show_model_download_actions(ui, language);
             }
             return;
         }
@@ -3246,11 +3550,22 @@ impl TtsApp {
             let directory_width = if language == UiLanguage::Chinese {
                 76.0
             } else {
-                94.0
+                82.0
             };
-            let summary_width =
-                (ui.available_width() - import_width - directory_width - 30.0 - gap * 3.0)
-                    .max(80.0);
+            let download_width = if language == UiLanguage::Chinese {
+                72.0
+            } else {
+                78.0
+            };
+            let selected_model_ready = self.qwen_model_ready
+                == Some((self.selected_qwen_version, QwenModelKind::VoiceClone));
+            let summary_width = (ui.available_width()
+                - import_width
+                - directory_width
+                - download_width
+                - 30.0
+                - gap * 4.0)
+                .max(8.0);
             ui.add_sized(
                 egui::vec2(summary_width, layout.metadata_height),
                 egui::Label::new(
@@ -3269,6 +3584,35 @@ impl TtsApp {
                 .clicked()
             {
                 self.open_model_directory(ModelDirectoryKind::Qwen3);
+            }
+            if ui
+                .add_enabled(
+                    !busy,
+                    model_download_entry_button(
+                        language,
+                        selected_model_ready,
+                        download_width,
+                        layout.metadata_height,
+                    ),
+                )
+                .on_hover_text(if selected_model_ready {
+                    language.text(
+                        "删除所选模型缓存并重新下载",
+                        "Delete and download the selected model again",
+                    )
+                } else {
+                    language.text(
+                        "下载模型；存在断点文件时从已有进度继续",
+                        "Download the model, resuming any partial files",
+                    )
+                })
+                .clicked()
+            {
+                if selected_model_ready {
+                    self.redownload_selected_qwen_model();
+                } else {
+                    self.prepare_selected_qwen_model();
+                }
             }
             if ui
                 .add(
@@ -3314,9 +3658,6 @@ impl TtsApp {
                     self.qwen_model_progress_label
                 ),
             ));
-        }
-        if self.qwen_model_preparing {
-            self.show_model_download_actions(ui, language);
         }
     }
 
@@ -3832,12 +4173,25 @@ impl TtsApp {
                 .corner_radius(10)
                 .inner_margin(egui::Margin::same(11))
                 .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("Whisper Large-v3 Turbo · Q8")
-                            .size(12.0)
-                            .strong()
-                            .color(TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Whisper Large-v3 Turbo · Q8")
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .add(model_directory_button(language, 82.0))
+                                    .clicked()
+                                {
+                                    self.open_model_directory(ModelDirectoryKind::Whisper);
+                                }
+                            },
+                        );
+                    });
                     ui.label(
                         egui::RichText::new(language.text(
                             "纯 Rust + Candle · Metal 加速 · 首次约需下载 478 MB",
@@ -3927,7 +4281,12 @@ impl TtsApp {
                                 ui.add(
                                     egui::ProgressBar::new(self.transcription_progress)
                                         .desired_width(280.0)
-                                        .show_percentage(),
+                                        .desired_height(20.0)
+                                        .corner_radius(4)
+                                        .text(format!(
+                                            "{:.1}%",
+                                            self.transcription_progress * 100.0
+                                        )),
                                 );
                             },
                         );
@@ -4079,6 +4438,23 @@ impl TtsApp {
             }
             self.show_inline_status(ui, language);
         });
+        if self.transcribing {
+            ui.add(model_download_progress_bar(
+                self.transcription_progress,
+                if self.loading_asr_model {
+                    language.text("Whisper 模型准备进度", "Whisper model progress")
+                } else {
+                    language.text("字幕识别进度", "Transcription progress")
+                },
+            ));
+        } else if self.saving_transcription {
+            ui.add(
+                egui::ProgressBar::new(0.5)
+                    .desired_height(20.0)
+                    .animate(true)
+                    .text(language.text("正在保存字幕…", "Saving subtitles…")),
+            );
+        }
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(language.text(
@@ -4111,6 +4487,145 @@ impl TtsApp {
                 })
                 .inner;
             response.on_hover_text(full_status);
+        }
+    }
+
+    fn show_generated_audio_player(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        if self.generated_audio_loading {
+            egui::Frame::new()
+                .fill(EDITOR_BACKGROUND)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(language.text(
+                                "正在载入生成音频的预览播放器…",
+                                "Loading the generated-audio preview…",
+                            ))
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::ProgressBar::new(0.35)
+                            .desired_height(18.0)
+                            .animate(true)
+                            .text(language.text("正在解码音频…", "Decoding audio…")),
+                    );
+                });
+            return;
+        }
+
+        let Some(player) = self.generated_audio_player.as_mut() else {
+            return;
+        };
+        let file_name = player
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("MP3")
+            .to_owned();
+        let duration = player.duration_seconds().max(0.001);
+        let mut position = player.position_seconds();
+        let playing = player.is_playing();
+        let mut playback_error = None;
+
+        egui::Frame::new()
+            .fill(EDITOR_BACKGROUND)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(9, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if playing {
+                                    language.text("⏸ 暂停", "⏸ Pause")
+                                } else {
+                                    language.text("▶ 播放", "▶ Play")
+                                })
+                                .size(11.0)
+                                .strong()
+                                .color(PRIMARY),
+                            )
+                            .fill(PRIMARY_SOFT)
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(205, 214, 255),
+                            ))
+                            .corner_radius(5)
+                            .min_size(egui::vec2(76.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        player.toggle();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("↺")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(TEXT_SECONDARY),
+                            )
+                            .fill(CARD_BACKGROUND)
+                            .stroke(egui::Stroke::new(1.0, BORDER))
+                            .corner_radius(5)
+                            .min_size(egui::vec2(32.0, 30.0)),
+                        )
+                        .on_hover_text(language.text("从头播放", "Play from start"))
+                        .clicked()
+                    {
+                        player.restart();
+                        position = 0.0;
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&file_name)
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&file_name);
+                    ui.style_mut().visuals.handle_shape = egui::style::HandleShape::Circle;
+                    let slider_width = (ui.available_width() - 116.0).max(120.0);
+                    if ui
+                        .add_sized(
+                            [slider_width, 30.0],
+                            egui::Slider::new(&mut position, 0.0..=duration)
+                                .show_value(false)
+                                .trailing_fill(true),
+                        )
+                        .changed()
+                        && let Err(error) = player.seek(position)
+                    {
+                        playback_error = Some(error);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {}",
+                            format_playback_seconds(position),
+                            format_playback_seconds(duration)
+                        ))
+                        .monospace()
+                        .size(10.0)
+                        .color(TEXT_PRIMARY),
+                    );
+                });
+            });
+
+        if let Some(error) = playback_error {
+            self.status = Some(StatusMessage::new(
+                StatusKind::Warning,
+                error.clone(),
+                error,
+            ));
         }
     }
 
@@ -4206,6 +4721,85 @@ impl TtsApp {
             }
         });
 
+        if self.generating {
+            let segment_progress = self.subtitle_progress.and_then(|(current, total)| {
+                (total > 0).then_some(current.saturating_sub(1) as f32 / total as f32)
+            });
+            let exact_progress = segment_progress
+                .or(self.qwen_model_progress)
+                .or(self.indextts_model_progress);
+            if let Some(progress) = exact_progress {
+                ui.add(model_download_progress_bar(
+                    progress,
+                    language.text("当前任务进度", "Current task progress"),
+                ));
+            } else {
+                ui.add(
+                    egui::ProgressBar::new(0.35)
+                        .desired_height(20.0)
+                        .animate(true)
+                        .text(language.text("正在处理当前任务…", "Processing the current task…")),
+                );
+            }
+        }
+
+        if !self.generating && (self.qwen_model_preparing || self.indextts_model_preparing) {
+            let progress = if self.qwen_model_preparing {
+                self.qwen_model_progress
+            } else {
+                self.indextts_model_progress
+            };
+            let label = if self.qwen_model_preparing {
+                self.qwen_model_progress_label.as_str()
+            } else {
+                self.indextts_model_progress_label.as_str()
+            };
+            if let Some(progress) = progress {
+                ui.add(model_download_progress_bar(progress, label));
+            } else {
+                ui.add(
+                    egui::ProgressBar::new(0.35)
+                        .desired_height(20.0)
+                        .animate(true)
+                        .text(label),
+                );
+            }
+        }
+
+        if !self.generating
+            && !self.qwen_model_preparing
+            && !self.indextts_model_preparing
+            && self.previewing
+        {
+            ui.add(
+                egui::ProgressBar::new(0.35)
+                    .desired_height(20.0)
+                    .animate(true)
+                    .text(language.text("正在生成试听音频…", "Generating the preview…")),
+            );
+        } else if !self.generating
+            && !self.previewing
+            && self.tts_engine == TtsEngine::Edge
+            && self.fetching_voices
+        {
+            ui.add(
+                egui::ProgressBar::new(0.35)
+                    .desired_height(20.0)
+                    .animate(true)
+                    .text(language.text("正在加载在线音色…", "Loading online voices…")),
+            );
+        }
+
+        if (self.qwen_model_preparing || self.indextts_model_preparing)
+            && model_download_control().state() != DownloadState::Idle
+        {
+            self.show_model_download_actions(ui, language);
+        }
+
+        if !self.generating {
+            self.show_generated_audio_player(ui, language);
+        }
+
         ui.add_space(6.0);
         let privacy_note = match self.tts_engine {
             TtsEngine::Edge => language.text(
@@ -4280,6 +4874,30 @@ fn model_directory_button(language: UiLanguage, width: f32) -> egui::Button<'sta
     .stroke(egui::Stroke::new(1.0, BORDER))
     .corner_radius(5)
     .min_size(egui::vec2(width, 28.0))
+}
+
+fn model_download_entry_button(
+    language: UiLanguage,
+    ready: bool,
+    width: f32,
+    height: f32,
+) -> egui::Button<'static> {
+    let label = match (language, ready) {
+        (UiLanguage::Chinese, true) => "重新下载",
+        (UiLanguage::Chinese, false) => "下载/续传",
+        (UiLanguage::English, true) => "Reload",
+        (UiLanguage::English, false) => "Download",
+    };
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(11.0)
+            .strong()
+            .color(PRIMARY),
+    )
+    .fill(EDITOR_BACKGROUND)
+    .stroke(egui::Stroke::new(1.0, BORDER))
+    .corner_radius(5)
+    .min_size(egui::vec2(width, height))
 }
 
 fn model_action_button(label: &str) -> egui::Button<'_> {
@@ -4443,6 +5061,20 @@ fn format_duration_seconds(seconds: u64) -> String {
         format!("{}:{:02}", seconds / 60, seconds % 60)
     } else {
         format!("{seconds}s")
+    }
+}
+
+fn format_playback_seconds(seconds: f32) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    if seconds >= 3_600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3_600,
+            (seconds / 60) % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
     }
 }
 
@@ -4875,6 +5507,28 @@ fn spawn_tts_worker() -> (
                                 &source_dir,
                             );
                         }
+                        WorkerCommand::PrepareQwenModel { version, kind } => {
+                            whisper_model = None;
+                            qwen_clone_prompt = None;
+                            prepare_qwen_model_locally(
+                                &mut qwen_model,
+                                &thread_event_tx,
+                                version,
+                                kind,
+                            );
+                        }
+                        WorkerCommand::RedownloadQwenModel { version, kind } => {
+                            whisper_model = None;
+                            qwen_clone_prompt = None;
+                            qwen_model = None;
+                            let _ = thread_event_tx.send(WorkerEvent::QwenModelReleased);
+                            redownload_qwen_model_locally(
+                                &mut qwen_model,
+                                &thread_event_tx,
+                                version,
+                                kind,
+                            );
+                        }
                         WorkerCommand::PrepareIndexTts => {
                             whisper_model = None;
                             qwen_clone_prompt = None;
@@ -4906,6 +5560,9 @@ fn spawn_tts_worker() -> (
                         } => {
                             save_transcription_locally(&thread_event_tx, output_path, cues, format)
                                 .await;
+                        }
+                        WorkerCommand::LoadGeneratedAudio { input_path } => {
+                            load_generated_audio(&thread_event_tx, input_path).await;
                         }
                     }
                 }
@@ -4966,6 +5623,49 @@ fn import_qwen_model_locally(
                 error,
             });
         }
+    }
+}
+
+fn redownload_qwen_model_locally(
+    model_cache: &mut Option<LocalQwenModel>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    version: QwenModelVersion,
+    kind: QwenModelKind,
+) {
+    let _ = event_tx.send(WorkerEvent::QwenModelPreparing { version, kind });
+    let progress_tx = event_tx.clone();
+    match LocalQwenModel::redownload(version, kind, move |progress| {
+        let _ = progress_tx.send(WorkerEvent::QwenModelDownload {
+            version,
+            kind,
+            file: progress.file.to_owned(),
+            downloaded_bytes: progress.downloaded_bytes,
+            total_bytes: progress.total_bytes,
+        });
+    }) {
+        Ok(model) => {
+            let device = model.device_label().to_owned();
+            *model_cache = Some(model);
+            let _ = event_tx.send(WorkerEvent::QwenModelReady {
+                version,
+                kind,
+                device,
+            });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::QwenModelFailed(error));
+        }
+    }
+}
+
+fn prepare_qwen_model_locally(
+    model_cache: &mut Option<LocalQwenModel>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    version: QwenModelVersion,
+    kind: QwenModelKind,
+) {
+    if let Err(error) = ensure_qwen_model(model_cache, event_tx, version, kind) {
+        let _ = event_tx.send(WorkerEvent::QwenModelFailed(error));
     }
 }
 
@@ -6153,11 +6853,8 @@ async fn transcribe_media_locally(
             ModelLoadingProgress::Loading { progress } => {
                 if last_progress_event.elapsed() >= Duration::from_millis(150) || progress >= 1.0 {
                     last_progress_event = Instant::now();
-                    let scaled = (progress.clamp(0.0, 1.0) * 100.0) as u64;
-                    let _ = progress_tx.send(WorkerEvent::AsrModelProgress {
-                        source: "Whisper model".to_owned(),
-                        downloaded_bytes: scaled,
-                        total_bytes: 100,
+                    let _ = progress_tx.send(WorkerEvent::AsrModelLoading {
+                        progress: progress.clamp(0.0, 1.0),
                     });
                 }
             }
@@ -6275,6 +6972,34 @@ fn ensure_subtitle_extension(mut path: PathBuf, format: SubtitleExportFormat) ->
         path.set_extension(expected);
     }
     path
+}
+
+async fn load_generated_audio(event_tx: &mpsc::UnboundedSender<WorkerEvent>, input_path: PathBuf) {
+    let decode_path = input_path.clone();
+    match tokio::task::spawn_blocking(move || asr::decode_media_mono(&decode_path)).await {
+        Ok(Ok(samples)) if !samples.is_empty() => {
+            let _ = event_tx.send(WorkerEvent::GeneratedAudioLoaded {
+                input_path,
+                samples,
+                sample_rate: timeline_audio::TIMELINE_SAMPLE_RATE,
+            });
+        }
+        Ok(Ok(_)) => {
+            let _ = event_tx.send(WorkerEvent::GeneratedAudioLoadFailed {
+                input_path,
+                error: "文件中没有可播放的音频采样。".to_owned(),
+            });
+        }
+        Ok(Err(error)) => {
+            let _ = event_tx.send(WorkerEvent::GeneratedAudioLoadFailed { input_path, error });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::GeneratedAudioLoadFailed {
+                input_path,
+                error: format!("音频解码任务异常：{error}"),
+            });
+        }
+    }
 }
 
 fn localized_transcription_error(error: &str) -> String {
