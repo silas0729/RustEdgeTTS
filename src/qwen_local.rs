@@ -159,6 +159,80 @@ pub struct DownloadProgress {
     pub total_bytes: u64,
 }
 
+/// Generation controls exposed by the Qwen3-TTS local model.
+///
+/// The values mirror `speakers-qwen3-tts::SynthesisOptions`; validation is
+/// performed at the boundary so malformed UI values can never allocate an
+/// unbounded Metal KV cache or pass NaN into the sampler.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QwenGenerationSettings {
+    pub max_length: usize,
+    pub temperature: f64,
+    pub top_k: usize,
+    pub top_p: f64,
+    pub repetition_penalty: f64,
+    pub min_new_tokens: usize,
+    pub seed: Option<u64>,
+}
+
+impl Default for QwenGenerationSettings {
+    fn default() -> Self {
+        let defaults = SynthesisOptions::default();
+        Self {
+            // The app historically sized this cache to the current text and
+            // capped long requests at 1024 frames to keep Metal memory cool.
+            // Users can raise the value explicitly in the advanced panel.
+            max_length: 1_024,
+            temperature: defaults.temperature,
+            top_k: defaults.top_k,
+            top_p: defaults.top_p,
+            repetition_penalty: defaults.repetition_penalty,
+            min_new_tokens: defaults.min_new_tokens,
+            // Keep the app's historical deterministic default while still
+            // exposing a random-seed toggle in the UI.
+            seed: Some(42),
+        }
+    }
+}
+
+impl QwenGenerationSettings {
+    pub fn validated(self) -> Self {
+        Self {
+            max_length: self.max_length.clamp(128, 4_096),
+            temperature: finite_clamp(self.temperature, 0.0, 2.0, 0.9),
+            top_k: self.top_k.clamp(1, 200),
+            top_p: finite_clamp(self.top_p, 0.01, 1.0, 0.9),
+            repetition_penalty: finite_clamp(self.repetition_penalty, 0.5, 3.0, 1.05),
+            min_new_tokens: self.min_new_tokens.clamp(0, 64),
+            seed: self.seed,
+        }
+    }
+
+    fn options_for(self, _text: &str) -> SynthesisOptions {
+        let settings = self.validated();
+        SynthesisOptions {
+            max_length: settings
+                .max_length
+                .max(settings.min_new_tokens.saturating_add(1).max(128)),
+            temperature: settings.temperature,
+            top_k: settings.top_k,
+            top_p: settings.top_p,
+            repetition_penalty: settings.repetition_penalty,
+            min_new_tokens: settings.min_new_tokens,
+            seed: settings.seed,
+            ..SynthesisOptions::default()
+        }
+    }
+}
+
+fn finite_clamp(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QwenVoice {
     Vivian,
@@ -371,22 +445,24 @@ impl LocalQwenModel {
         self.kind
     }
 
+    #[allow(dead_code)]
     pub fn synthesize(
         &self,
         text: &str,
         voice: QwenVoice,
         language: QwenSynthesisLanguage,
     ) -> Result<AudioBuffer, String> {
-        let mut options = SynthesisOptions {
-            // The upstream 2048-frame default allocates a very large KV cache
-            // even for a five-second subtitle. Size the cache to the actual text
-            // so sequential cues do not exhaust Apple unified/Metal memory.
-            max_length: synthesis_frame_budget(text),
-            // A stable seed keeps sampling/prosody consistent across separately
-            // synthesized subtitle cues while the preset speaker stays fixed.
-            seed: Some(42),
-            ..SynthesisOptions::default()
-        };
+        self.synthesize_with_settings(text, voice, language, QwenGenerationSettings::default())
+    }
+
+    pub fn synthesize_with_settings(
+        &self,
+        text: &str,
+        voice: QwenVoice,
+        language: QwenSynthesisLanguage,
+        settings: QwenGenerationSettings,
+    ) -> Result<AudioBuffer, String> {
+        let mut options = settings.options_for(text);
         let first_attempt = self.model.synthesize_with_voice(
             text,
             voice.speaker(),
@@ -431,17 +507,29 @@ impl LocalQwenModel {
             .map_err(|error| format!("无法从参考音频创建克隆提示：{error:#}"))
     }
 
+    #[allow(dead_code)]
     pub fn synthesize_voice_clone(
         &self,
         text: &str,
         prompt: &LocalVoiceClonePrompt,
         language: QwenSynthesisLanguage,
     ) -> Result<AudioBuffer, String> {
-        let mut options = SynthesisOptions {
-            max_length: synthesis_frame_budget(text),
-            seed: Some(42),
-            ..SynthesisOptions::default()
-        };
+        self.synthesize_voice_clone_with_settings(
+            text,
+            prompt,
+            language,
+            QwenGenerationSettings::default(),
+        )
+    }
+
+    pub fn synthesize_voice_clone_with_settings(
+        &self,
+        text: &str,
+        prompt: &LocalVoiceClonePrompt,
+        language: QwenSynthesisLanguage,
+        settings: QwenGenerationSettings,
+    ) -> Result<AudioBuffer, String> {
+        let mut options = settings.options_for(text);
         let first_attempt = self.model.synthesize_voice_clone(
             text,
             &prompt.prompt,
@@ -1143,6 +1231,7 @@ pub fn load_reference_audio(path: &Path) -> Result<AudioBuffer, String> {
     Ok(audio)
 }
 
+#[allow(dead_code)]
 fn synthesis_frame_budget(text: &str) -> usize {
     let cjk_characters = text
         .chars()
@@ -1244,6 +1333,35 @@ mod tests {
         assert!((128..512).contains(&short));
         assert_eq!(long, 1_024);
         assert!(short < SynthesisOptions::default().max_length);
+    }
+
+    #[test]
+    fn generation_settings_are_finite_and_bounded() {
+        let settings = QwenGenerationSettings {
+            max_length: 0,
+            temperature: f64::NAN,
+            top_k: usize::MAX,
+            top_p: f64::INFINITY,
+            repetition_penalty: -10.0,
+            min_new_tokens: usize::MAX,
+            seed: None,
+        }
+        .validated();
+        assert_eq!(settings.max_length, 128);
+        assert_eq!(settings.temperature, 0.9);
+        assert_eq!(settings.top_k, 200);
+        assert_eq!(settings.top_p, 0.9);
+        assert_eq!(settings.repetition_penalty, 0.5);
+        assert_eq!(settings.min_new_tokens, 64);
+    }
+
+    #[test]
+    fn custom_max_length_is_forwarded_to_generation_options() {
+        let settings = QwenGenerationSettings {
+            max_length: 2_048,
+            ..QwenGenerationSettings::default()
+        };
+        assert_eq!(settings.options_for("短文本").max_length, 2_048);
     }
 
     #[test]

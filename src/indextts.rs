@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
@@ -35,6 +35,83 @@ pub enum IndexTtsProgress {
     },
 }
 
+/// Controls accepted by the pinned official IndexTTS-2.5 `infer_v2_5.py`.
+/// Keeping these values in Rust makes the desktop UI and the offline bridge
+/// share one validated contract.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexTtsSettings {
+    pub duration_factor: f64,
+    pub text_normalization: bool,
+    pub max_text_tokens_per_segment: usize,
+    pub interval_silence_ms: usize,
+    pub use_random: bool,
+    pub emo_alpha: f64,
+    pub use_emo_text: bool,
+    pub emo_text: String,
+    pub do_sample: bool,
+    pub temperature: f64,
+    pub top_k: usize,
+    pub top_p: f64,
+    pub repetition_penalty: f64,
+    pub length_penalty: f64,
+    pub num_beams: usize,
+    pub max_mel_tokens: usize,
+}
+
+impl Default for IndexTtsSettings {
+    fn default() -> Self {
+        Self {
+            duration_factor: 1.0,
+            text_normalization: true,
+            max_text_tokens_per_segment: 120,
+            interval_silence_ms: 200,
+            use_random: false,
+            emo_alpha: 1.0,
+            use_emo_text: false,
+            emo_text: String::new(),
+            do_sample: true,
+            temperature: 0.8,
+            top_k: 30,
+            top_p: 0.8,
+            repetition_penalty: 10.0,
+            length_penalty: 0.0,
+            num_beams: 3,
+            max_mel_tokens: 1_500,
+        }
+    }
+}
+
+impl IndexTtsSettings {
+    pub fn validated(&self) -> Self {
+        Self {
+            duration_factor: finite_clamp(self.duration_factor, 0.5, 2.0, 1.0),
+            text_normalization: self.text_normalization,
+            max_text_tokens_per_segment: self.max_text_tokens_per_segment.clamp(16, 512),
+            interval_silence_ms: self.interval_silence_ms.min(5_000),
+            use_random: self.use_random,
+            emo_alpha: finite_clamp(self.emo_alpha, 0.0, 1.0, 1.0),
+            use_emo_text: self.use_emo_text,
+            emo_text: self.emo_text.chars().take(500).collect(),
+            do_sample: self.do_sample,
+            temperature: finite_clamp(self.temperature, 0.0, 2.0, 0.8),
+            top_k: self.top_k.clamp(1, 200),
+            top_p: finite_clamp(self.top_p, 0.01, 1.0, 0.8),
+            repetition_penalty: finite_clamp(self.repetition_penalty, 0.1, 20.0, 10.0),
+            length_penalty: finite_clamp(self.length_penalty, -2.0, 2.0, 0.0),
+            num_beams: self.num_beams.clamp(1, 8),
+            max_mel_tokens: self.max_mel_tokens.clamp(128, 4_000),
+        }
+    }
+}
+
+fn finite_clamp(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
 pub struct IndexTtsRuntime {
     source_dir: PathBuf,
     model_dir: PathBuf,
@@ -55,6 +132,67 @@ impl IndexTtsRuntime {
         runtime_python(&self.source_dir).is_file()
             && self.source_dir.join(RUNTIME_READY_MARKER).is_file()
             && model_is_ready(&self.model_dir)
+    }
+
+    /// Import a complete IndexTTS-2.5 model directory without contacting
+    /// Hugging Face. This is useful when the machine running the app has no
+    /// access to the model host but another machine has already downloaded the
+    /// official checkpoint tree.
+    pub fn import_offline_model(
+        &self,
+        selected_dir: &Path,
+        mut on_progress: impl FnMut(IndexTtsProgress),
+    ) -> Result<PathBuf, String> {
+        let control = model_download_control();
+        let _download_session = control.begin();
+        control.checkpoint()?;
+        let source_dir = locate_model_source(selected_dir)?;
+        validate_model_dir(&source_dir)?;
+        std::fs::create_dir_all(&self.model_dir)
+            .map_err(|error| format!("无法创建 IndexTTS 模型目录：{error}"))?;
+
+        let files = required_model_files();
+        let total_bytes = files
+            .iter()
+            .map(|(relative, _)| file_size(&source_dir.join(relative)))
+            .sum::<u64>();
+        let mut copied_bytes = 0_u64;
+        on_progress(IndexTtsProgress::ModelDownload {
+            phase: "正在导入 IndexTTS-2.5 离线模型".to_owned(),
+            downloaded_bytes: 0,
+            total_bytes,
+        });
+        for (relative, minimum_size) in files {
+            control.checkpoint()?;
+            let source = source_dir.join(relative);
+            let destination = self.model_dir.join(relative);
+            let size = file_size(&source);
+            import_file(
+                &source,
+                &destination,
+                *minimum_size,
+                control,
+                &mut |file_bytes| {
+                    let progress = copied_bytes.saturating_add(file_bytes).min(total_bytes);
+                    on_progress(IndexTtsProgress::ModelDownload {
+                        phase: format!("正在导入 {relative}"),
+                        downloaded_bytes: progress,
+                        total_bytes,
+                    });
+                },
+            )?;
+            copied_bytes = copied_bytes.saturating_add(size);
+            on_progress(IndexTtsProgress::ModelDownload {
+                phase: format!("已导入 {relative}"),
+                downloaded_bytes: copied_bytes.min(total_bytes),
+                total_bytes,
+            });
+        }
+        validate_model_dir(&self.model_dir)?;
+        on_progress(IndexTtsProgress::Phase(
+            "IndexTTS-2.5 离线模型导入完成".to_owned(),
+        ));
+        Ok(self.model_dir.clone())
     }
 
     pub fn ensure_ready(
@@ -146,11 +284,26 @@ impl IndexTtsRuntime {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn synthesize_batch(
         &self,
         texts: &[String],
         reference_audio: &Path,
         rate_percent: i32,
+        on_progress: impl FnMut(IndexTtsProgress),
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let settings = IndexTtsSettings {
+            duration_factor: (1.0 / (1.0 + rate_percent as f64 / 100.0)).clamp(0.5, 2.0),
+            ..IndexTtsSettings::default()
+        };
+        self.synthesize_batch_with_settings(texts, reference_audio, &settings, on_progress)
+    }
+
+    pub fn synthesize_batch_with_settings(
+        &self,
+        texts: &[String],
+        reference_audio: &Path,
+        settings: &IndexTtsSettings,
         mut on_progress: impl FnMut(IndexTtsProgress),
     ) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
@@ -190,10 +343,27 @@ impl IndexTtsRuntime {
                 })
             })
             .collect();
-        let duration_factor = (1.0 / (1.0 + rate_percent as f64 / 100.0)).clamp(0.5, 2.0);
+        let settings = settings.validated();
         let manifest = serde_json::json!({
             "reference_audio": reference_audio,
-            "duration_factor": duration_factor,
+            "duration_factor": settings.duration_factor,
+            "text_normalization": settings.text_normalization,
+            "max_text_tokens_per_segment": settings.max_text_tokens_per_segment,
+            "interval_silence_ms": settings.interval_silence_ms,
+            "use_random": settings.use_random,
+            "emo_alpha": settings.emo_alpha,
+            "use_emo_text": settings.use_emo_text,
+            "emo_text": settings.emo_text,
+            "generation": {
+                "do_sample": settings.do_sample,
+                "temperature": settings.temperature,
+                "top_k": settings.top_k,
+                "top_p": settings.top_p,
+                "repetition_penalty": settings.repetition_penalty,
+                "length_penalty": settings.length_penalty,
+                "num_beams": settings.num_beams,
+                "max_mel_tokens": settings.max_mel_tokens,
+            },
             "items": items,
         });
         let manifest_path = task_dir.join("manifest.json");
@@ -258,25 +428,127 @@ fn runtime_python(source_dir: &Path) -> PathBuf {
 }
 
 fn model_is_ready(model_dir: &Path) -> bool {
-    [
-        "config.yaml",
-        "codec.pth",
-        "gpt.pth",
-        "multilingual_zh_ja_yue_char_del.tiktoken",
-        "s2mel.pth",
-        "wav2vec2bert_stats.pt",
-        "feat1.pt",
-        "feat2.pt",
-        "hf_cache/campplus_cn_common.bin",
-        "hf_cache/semantic_codec_model.safetensors",
-        "hf_cache/bigvgan/config.json",
-        "hf_cache/bigvgan/bigvgan_generator.pt",
-        "hf_cache/w2v-bert-2.0/config.json",
-        "hf_cache/w2v-bert-2.0/model.safetensors",
-        "qwen0.6bemo4-merge/model.safetensors",
+    validate_model_dir(model_dir).is_ok()
+}
+
+fn required_model_files() -> &'static [(&'static str, u64)] {
+    &[
+        ("config.yaml", 100),
+        ("codec.pth", 100_000_000),
+        ("gpt.pth", 100_000_000),
+        ("multilingual_zh_ja_yue_char_del.tiktoken", 100_000),
+        ("s2mel.pth", 100_000_000),
+        ("wav2vec2bert_stats.pt", 100),
+        ("feat1.pt", 100),
+        ("feat2.pt", 100),
+        ("hf_cache/campplus_cn_common.bin", 1_000_000),
+        ("hf_cache/semantic_codec_model.safetensors", 1_000_000),
+        ("hf_cache/bigvgan/config.json", 100),
+        ("hf_cache/bigvgan/bigvgan_generator.pt", 100_000_000),
+        ("hf_cache/w2v-bert-2.0/config.json", 100),
+        ("hf_cache/w2v-bert-2.0/model.safetensors", 100_000_000),
+        ("qwen0.6bemo4-merge/model.safetensors", 100_000_000),
     ]
-    .iter()
-    .all(|relative| model_dir.join(relative).is_file())
+}
+
+fn locate_model_source(selected_dir: &Path) -> Result<PathBuf, String> {
+    let candidates = [
+        selected_dir.to_path_buf(),
+        selected_dir.join("IndexTTS-2.5"),
+        selected_dir.join("models"),
+        selected_dir.join("IndexTeam/IndexTTS-2.5"),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("config.yaml").is_file())
+        .ok_or_else(|| {
+            "所选文件夹中没有找到 IndexTTS-2.5 模型。请选择包含 config.yaml 的完整模型目录。"
+                .to_owned()
+        })
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn validate_model_dir(model_dir: &Path) -> Result<(), String> {
+    let missing: Vec<_> = required_model_files()
+        .iter()
+        .filter(|(relative, minimum_size)| {
+            let path = model_dir.join(relative);
+            !path.is_file() || file_size(&path) < *minimum_size
+        })
+        .map(|(relative, _)| *relative)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "IndexTTS-2.5 模型不完整，缺少或尺寸异常：{}",
+            missing.join("、")
+        ))
+    }
+}
+
+fn import_file(
+    source: &Path,
+    destination: &Path,
+    minimum_size: u64,
+    control: &DownloadControl,
+    on_progress: &mut impl FnMut(u64),
+) -> Result<(), String> {
+    let source_size = file_size(source);
+    if !source.is_file() || source_size < minimum_size {
+        return Err(format!("离线模型文件缺失或不完整：{}", source.display()));
+    }
+    if source == destination {
+        on_progress(source_size);
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建 IndexTTS 模型目录：{error}"))?;
+    }
+    let part_path = destination.with_extension("import");
+    let _ = std::fs::remove_file(&part_path);
+    let resolved_source = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    if std::fs::hard_link(&resolved_source, &part_path).is_ok() {
+        on_progress(source_size);
+    } else {
+        let mut input =
+            std::fs::File::open(source).map_err(|error| format!("无法读取离线模型：{error}"))?;
+        let mut output = std::fs::File::create(&part_path)
+            .map_err(|error| format!("无法写入离线模型：{error}"))?;
+        let mut copied = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            control.checkpoint()?;
+            let count = input
+                .read(&mut buffer)
+                .map_err(|error| format!("读取离线模型失败：{error}"))?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("复制离线模型失败：{error}"))?;
+            copied = copied.saturating_add(count as u64);
+            on_progress(copied);
+        }
+        output
+            .flush()
+            .map_err(|error| format!("写入离线模型失败：{error}"))?;
+    }
+    if file_size(&part_path) < minimum_size {
+        let _ = std::fs::remove_file(&part_path);
+        return Err("导入后的 IndexTTS 模型文件不完整。".to_owned());
+    }
+    let _ = std::fs::remove_file(destination);
+    std::fs::rename(&part_path, destination)
+        .map_err(|error| format!("无法安装 IndexTTS 模型文件：{error}"))?;
+    Ok(())
 }
 
 fn verify_official_revision(source_dir: &Path) -> Result<(), String> {
@@ -453,5 +725,35 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn generation_settings_are_finite_and_bounded() {
+        let settings = IndexTtsSettings {
+            duration_factor: f64::NAN,
+            max_text_tokens_per_segment: 0,
+            interval_silence_ms: usize::MAX,
+            emo_alpha: f64::INFINITY,
+            temperature: -1.0,
+            top_k: usize::MAX,
+            top_p: f64::NAN,
+            repetition_penalty: f64::INFINITY,
+            length_penalty: -10.0,
+            num_beams: 0,
+            max_mel_tokens: usize::MAX,
+            ..IndexTtsSettings::default()
+        }
+        .validated();
+        assert_eq!(settings.duration_factor, 1.0);
+        assert_eq!(settings.max_text_tokens_per_segment, 16);
+        assert_eq!(settings.interval_silence_ms, 5_000);
+        assert_eq!(settings.emo_alpha, 1.0);
+        assert_eq!(settings.temperature, 0.0);
+        assert_eq!(settings.top_k, 200);
+        assert_eq!(settings.top_p, 0.8);
+        assert_eq!(settings.repetition_penalty, 10.0);
+        assert_eq!(settings.length_penalty, -2.0);
+        assert_eq!(settings.num_beams, 1);
+        assert_eq!(settings.max_mel_tokens, 4_000);
     }
 }

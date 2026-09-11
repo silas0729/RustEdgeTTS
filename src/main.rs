@@ -27,10 +27,10 @@ mod timeline_audio;
 use asr::{RecognitionLanguage, SubtitleExportFormat};
 use audio_player::GeneratedAudioPlayer;
 use download_control::{DownloadState, is_download_cancelled, model_download_control};
-use indextts::{IndexTtsProgress, IndexTtsRuntime};
+use indextts::{IndexTtsProgress, IndexTtsRuntime, IndexTtsSettings};
 use qwen_local::{
-    LocalQwenModel, LocalVoiceClonePrompt, QwenModelKind, QwenModelVersion, QwenSynthesisLanguage,
-    QwenVoice,
+    LocalQwenModel, LocalVoiceClonePrompt, QwenGenerationSettings, QwenModelKind, QwenModelVersion,
+    QwenSynthesisLanguage, QwenVoice,
 };
 use subtitles::{SubtitleCue, SubtitleTrack, format_timestamp, parse_subtitle};
 
@@ -70,12 +70,16 @@ enum WorkerCommand {
         voice: VoiceSelection,
         rate_percent: i32,
         volume_percent: i32,
+        qwen_settings: QwenGenerationSettings,
+        indextts_settings: IndexTtsSettings,
     },
     Generate {
         text: String,
         voice: VoiceSelection,
         rate_percent: i32,
         volume_percent: i32,
+        qwen_settings: QwenGenerationSettings,
+        indextts_settings: IndexTtsSettings,
         output_path: PathBuf,
     },
     GenerateSubtitles {
@@ -83,6 +87,8 @@ enum WorkerCommand {
         voice: VoiceSelection,
         rate_percent: i32,
         volume_percent: i32,
+        qwen_settings: QwenGenerationSettings,
+        indextts_settings: IndexTtsSettings,
         output_path: PathBuf,
     },
     ImportQwenModel {
@@ -97,6 +103,9 @@ enum WorkerCommand {
     RedownloadQwenModel {
         version: QwenModelVersion,
         kind: QwenModelKind,
+    },
+    ImportIndexTtsModel {
+        source_dir: PathBuf,
     },
     PrepareIndexTts,
     TranscribeMedia {
@@ -170,6 +179,15 @@ enum WorkerEvent {
     },
     IndexTtsReady,
     IndexTtsFailed(String),
+    IndexTtsImportProgress {
+        phase: String,
+        copied_bytes: u64,
+        total_bytes: u64,
+    },
+    IndexTtsImported {
+        model_dir: PathBuf,
+    },
+    IndexTtsImportFailed(String),
     IndexTtsInferencePhase(String),
     PreviewFinished,
     PreviewFailed(String),
@@ -295,6 +313,7 @@ struct CachedQwenClonePrompt {
 struct QwenOutputSettings {
     rate_percent: i32,
     volume_percent: i32,
+    qwen_settings: QwenGenerationSettings,
     output_path: PathBuf,
 }
 
@@ -646,6 +665,30 @@ struct TtsApp {
     subtitle_progress: Option<(usize, usize)>,
     rate_percent: i32,
     volume_percent: i32,
+    qwen_max_length: usize,
+    qwen_temperature: f64,
+    qwen_top_k: usize,
+    qwen_top_p: f64,
+    qwen_repetition_penalty: f64,
+    qwen_min_new_tokens: usize,
+    qwen_seed: u64,
+    qwen_random_seed: bool,
+    indextts_duration_factor: f64,
+    indextts_text_normalization: bool,
+    indextts_max_text_tokens: usize,
+    indextts_interval_silence_ms: usize,
+    indextts_use_random: bool,
+    indextts_emo_alpha: f64,
+    indextts_use_emo_text: bool,
+    indextts_emo_text: String,
+    indextts_do_sample: bool,
+    indextts_temperature: f64,
+    indextts_top_k: usize,
+    indextts_top_p: f64,
+    indextts_repetition_penalty: f64,
+    indextts_length_penalty: f64,
+    indextts_num_beams: usize,
+    indextts_max_mel_tokens: usize,
     ui_language: UiLanguage,
     fetching_voices: bool,
     qwen_model_preparing: bool,
@@ -658,6 +701,7 @@ struct TtsApp {
     indextts_model_ready: bool,
     indextts_model_progress: Option<f32>,
     indextts_model_progress_label: String,
+    indextts_manual_help_open: bool,
     previewing: bool,
     generating: bool,
     last_generated_audio: Option<PathBuf>,
@@ -728,6 +772,30 @@ impl TtsApp {
             subtitle_progress: None,
             rate_percent: 0,
             volume_percent: 0,
+            qwen_max_length: QwenGenerationSettings::default().max_length,
+            qwen_temperature: QwenGenerationSettings::default().temperature,
+            qwen_top_k: QwenGenerationSettings::default().top_k,
+            qwen_top_p: QwenGenerationSettings::default().top_p,
+            qwen_repetition_penalty: QwenGenerationSettings::default().repetition_penalty,
+            qwen_min_new_tokens: QwenGenerationSettings::default().min_new_tokens,
+            qwen_seed: 42,
+            qwen_random_seed: false,
+            indextts_duration_factor: IndexTtsSettings::default().duration_factor,
+            indextts_text_normalization: IndexTtsSettings::default().text_normalization,
+            indextts_max_text_tokens: IndexTtsSettings::default().max_text_tokens_per_segment,
+            indextts_interval_silence_ms: IndexTtsSettings::default().interval_silence_ms,
+            indextts_use_random: IndexTtsSettings::default().use_random,
+            indextts_emo_alpha: IndexTtsSettings::default().emo_alpha,
+            indextts_use_emo_text: IndexTtsSettings::default().use_emo_text,
+            indextts_emo_text: IndexTtsSettings::default().emo_text,
+            indextts_do_sample: IndexTtsSettings::default().do_sample,
+            indextts_temperature: IndexTtsSettings::default().temperature,
+            indextts_top_k: IndexTtsSettings::default().top_k,
+            indextts_top_p: IndexTtsSettings::default().top_p,
+            indextts_repetition_penalty: IndexTtsSettings::default().repetition_penalty,
+            indextts_length_penalty: IndexTtsSettings::default().length_penalty,
+            indextts_num_beams: IndexTtsSettings::default().num_beams,
+            indextts_max_mel_tokens: IndexTtsSettings::default().max_mel_tokens,
             ui_language: UiLanguage::Chinese,
             fetching_voices,
             qwen_model_preparing: false,
@@ -740,6 +808,7 @@ impl TtsApp {
             indextts_model_ready: false,
             indextts_model_progress: None,
             indextts_model_progress_label: String::new(),
+            indextts_manual_help_open: false,
             previewing: false,
             generating: false,
             last_generated_audio: None,
@@ -1103,6 +1172,49 @@ impl TtsApp {
                         StatusKind::Info,
                         "IndexTTS-2.5 官方 v2.5.0 模型已就绪，正在本机推理…",
                         "The official IndexTTS-2.5 v2.5.0 model is ready for local inference…",
+                    ));
+                }
+                WorkerEvent::IndexTtsImportProgress {
+                    phase,
+                    copied_bytes,
+                    total_bytes,
+                } => {
+                    self.indextts_model_preparing = true;
+                    self.indextts_model_ready = false;
+                    self.indextts_model_progress = (total_bytes > 0)
+                        .then_some((copied_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0));
+                    self.indextts_model_progress_label = phase.clone();
+                    let transfer = format_transfer_progress(copied_bytes, total_bytes);
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Info,
+                        format!("正在导入 IndexTTS-2.5 离线模型：{phase} · {transfer}"),
+                        format!("Importing the offline IndexTTS-2.5 model: {phase} · {transfer}"),
+                    ));
+                }
+                WorkerEvent::IndexTtsImported { model_dir } => {
+                    self.indextts_model_preparing = false;
+                    self.indextts_model_progress = None;
+                    self.indextts_manual_help_open = false;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Success,
+                        format!(
+                            "IndexTTS-2.5 离线模型已导入：{}。请点击“准备模型”完成本机运行环境检查。",
+                            model_dir.display()
+                        ),
+                        format!(
+                            "The offline IndexTTS-2.5 model was imported to {}. Select Prepare model to finish the local runtime check.",
+                            model_dir.display()
+                        ),
+                    ));
+                }
+                WorkerEvent::IndexTtsImportFailed(error) => {
+                    self.indextts_model_preparing = false;
+                    self.indextts_model_progress = None;
+                    self.indextts_manual_help_open = true;
+                    self.status = Some(StatusMessage::new(
+                        StatusKind::Error,
+                        format!("IndexTTS-2.5 离线模型导入失败：{error}"),
+                        format!("Could not import the offline IndexTTS-2.5 model: {error}"),
                     ));
                 }
                 WorkerEvent::IndexTtsFailed(error) => {
@@ -1546,6 +1658,49 @@ impl TtsApp {
         }
     }
 
+    fn import_indextts_model(&mut self) {
+        if self.tts_engine != TtsEngine::IndexTts25 || self.tts_controls_busy() {
+            return;
+        }
+        let Some(source_dir) = rfd::FileDialog::new()
+            .set_title(self.ui_language.text(
+                "选择完整的 IndexTTS-2.5 模型文件夹",
+                "Choose the complete IndexTTS-2.5 model folder",
+            ))
+            .pick_folder()
+        else {
+            return;
+        };
+        match self.command_tx.send(WorkerCommand::ImportIndexTtsModel {
+            source_dir: source_dir.clone(),
+        }) {
+            Ok(()) => {
+                self.indextts_model_preparing = true;
+                self.indextts_model_ready = false;
+                self.indextts_model_progress = Some(0.0);
+                self.indextts_model_progress_label = self
+                    .ui_language
+                    .text("正在检查离线模型文件", "Checking offline model files")
+                    .to_owned();
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Info,
+                    format!("正在导入 IndexTTS-2.5 离线模型：{}", source_dir.display()),
+                    format!(
+                        "Importing the offline IndexTTS-2.5 model: {}",
+                        source_dir.display()
+                    ),
+                ));
+            }
+            Err(_) => {
+                self.status = Some(StatusMessage::new(
+                    StatusKind::Error,
+                    "后台服务已停止，请重新启动应用。",
+                    "The background worker stopped. Restart the app.",
+                ));
+            }
+        }
+    }
+
     fn open_model_directory(&mut self, kind: ModelDirectoryKind) {
         let directory = match kind {
             ModelDirectoryKind::Qwen3 => qwen_local::models_directory(),
@@ -1863,6 +2018,8 @@ impl TtsApp {
                 voice,
                 rate_percent: self.rate_percent,
                 volume_percent: self.volume_percent,
+                qwen_settings: self.qwen_generation_settings(),
+                indextts_settings: self.indextts_settings(),
                 output_path,
             },
             GenerationContent::Subtitles(cues) => WorkerCommand::GenerateSubtitles {
@@ -1870,6 +2027,8 @@ impl TtsApp {
                 voice,
                 rate_percent: self.rate_percent,
                 volume_percent: self.volume_percent,
+                qwen_settings: self.qwen_generation_settings(),
+                indextts_settings: self.indextts_settings(),
                 output_path,
             },
         };
@@ -1990,6 +2149,8 @@ impl TtsApp {
             voice,
             rate_percent: self.rate_percent,
             volume_percent: self.volume_percent,
+            qwen_settings: self.qwen_generation_settings(),
+            indextts_settings: self.indextts_settings(),
         }) {
             Ok(()) => {
                 self.previewing = true;
@@ -2269,6 +2430,73 @@ impl TtsApp {
         }
     }
 
+    fn qwen_generation_settings(&self) -> QwenGenerationSettings {
+        QwenGenerationSettings {
+            max_length: self.qwen_max_length,
+            temperature: self.qwen_temperature,
+            top_k: self.qwen_top_k,
+            top_p: self.qwen_top_p,
+            repetition_penalty: self.qwen_repetition_penalty,
+            min_new_tokens: self.qwen_min_new_tokens,
+            seed: (!self.qwen_random_seed).then_some(self.qwen_seed),
+        }
+        .validated()
+    }
+
+    fn indextts_settings(&self) -> IndexTtsSettings {
+        let rate_factor = (1.0 / (1.0 + self.rate_percent as f64 / 100.0)).clamp(0.5, 2.0);
+        IndexTtsSettings {
+            duration_factor: rate_factor * self.indextts_duration_factor,
+            text_normalization: self.indextts_text_normalization,
+            max_text_tokens_per_segment: self.indextts_max_text_tokens,
+            interval_silence_ms: self.indextts_interval_silence_ms,
+            use_random: self.indextts_use_random,
+            emo_alpha: self.indextts_emo_alpha,
+            use_emo_text: self.indextts_use_emo_text,
+            emo_text: self.indextts_emo_text.clone(),
+            do_sample: self.indextts_do_sample,
+            temperature: self.indextts_temperature,
+            top_k: self.indextts_top_k,
+            top_p: self.indextts_top_p,
+            repetition_penalty: self.indextts_repetition_penalty,
+            length_penalty: self.indextts_length_penalty,
+            num_beams: self.indextts_num_beams,
+            max_mel_tokens: self.indextts_max_mel_tokens,
+        }
+        .validated()
+    }
+
+    fn reset_generation_settings(&mut self) {
+        self.rate_percent = 0;
+        self.volume_percent = 0;
+        let qwen = QwenGenerationSettings::default();
+        self.qwen_max_length = qwen.max_length;
+        self.qwen_temperature = qwen.temperature;
+        self.qwen_top_k = qwen.top_k;
+        self.qwen_top_p = qwen.top_p;
+        self.qwen_repetition_penalty = qwen.repetition_penalty;
+        self.qwen_min_new_tokens = qwen.min_new_tokens;
+        self.qwen_seed = 42;
+        self.qwen_random_seed = false;
+        let index = IndexTtsSettings::default();
+        self.indextts_duration_factor = index.duration_factor;
+        self.indextts_text_normalization = index.text_normalization;
+        self.indextts_max_text_tokens = index.max_text_tokens_per_segment;
+        self.indextts_interval_silence_ms = index.interval_silence_ms;
+        self.indextts_use_random = index.use_random;
+        self.indextts_emo_alpha = index.emo_alpha;
+        self.indextts_use_emo_text = index.use_emo_text;
+        self.indextts_emo_text = index.emo_text;
+        self.indextts_do_sample = index.do_sample;
+        self.indextts_temperature = index.temperature;
+        self.indextts_top_k = index.top_k;
+        self.indextts_top_p = index.top_p;
+        self.indextts_repetition_penalty = index.repetition_penalty;
+        self.indextts_length_penalty = index.length_penalty;
+        self.indextts_num_beams = index.num_beams;
+        self.indextts_max_mel_tokens = index.max_mel_tokens;
+    }
+
     fn voice_selection_error(&self) -> (&'static str, &'static str) {
         if (self.tts_engine == TtsEngine::Qwen3Local
             && self.qwen_voice_mode == QwenVoiceMode::Clone)
@@ -2454,10 +2682,77 @@ impl eframe::App for TtsApp {
             let context = ui.ctx().clone();
             self.show_qwen_manual_help(&context, language);
         }
+        if self.indextts_manual_help_open {
+            let context = ui.ctx().clone();
+            self.show_indextts_manual_help(&context, language);
+        }
     }
 }
 
 impl TtsApp {
+    fn show_indextts_manual_help(&mut self, context: &egui::Context, language: UiLanguage) {
+        let mut open = self.indextts_manual_help_open;
+        let mut import_clicked = false;
+        egui::Window::new(language.text(
+            "IndexTTS-2.5 离线模型导入",
+            "IndexTTS-2.5 offline model import",
+        ))
+        .id(egui::Id::new("indextts-offline-model-help"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(600.0)
+        .show(context, |ui| {
+            ui.label(
+                egui::RichText::new(language.text(
+                    "下载不可用时，可在另一台机器准备完整的官方 IndexTTS-2.5 v2.5.0 模型目录，再选择该目录导入。",
+                    "When downloading is unavailable, prepare the complete official IndexTTS-2.5 v2.5.0 model directory on another machine and import it here.",
+                ))
+                .size(13.0)
+                .color(TEXT_PRIMARY),
+            );
+            ui.add_space(8.0);
+            ui.hyperlink_to(
+                "IndexTeam/IndexTTS-2.5",
+                "https://huggingface.co/IndexTeam/IndexTTS-2.5",
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(language.text(
+                    "请选择包含 config.yaml 的完整 models 文件夹，不能只选择单个权重文件。程序会校验 15 个必需文件，并优先使用硬链接；跨磁盘时自动复制。",
+                    "Select the complete models folder containing config.yaml, not a single weight file. The app validates all 15 required files and uses hard links when possible, copying across volumes.",
+                ))
+                .size(12.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.add_space(12.0);
+            if ui
+                .add_enabled(
+                    !self.tts_controls_busy(),
+                    egui::Button::new(
+                        egui::RichText::new(language.text(
+                            "选择模型文件夹并导入",
+                            "Choose model folder and import",
+                        ))
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                    )
+                    .fill(PRIMARY)
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(8)
+                    .min_size(egui::vec2(190.0, 36.0)),
+                )
+                .clicked()
+            {
+                import_clicked = true;
+            }
+        });
+        self.indextts_manual_help_open = open && !import_clicked;
+        if import_clicked {
+            self.import_indextts_model();
+        }
+    }
+
     fn show_qwen_manual_help(&mut self, context: &egui::Context, language: UiLanguage) {
         let version = self.selected_qwen_version;
         let kind = self.selected_qwen_kind();
@@ -3227,8 +3522,7 @@ impl TtsApp {
                             .corner_radius(7)
                             .min_size(egui::vec2(70.0, 24.0));
                             if ui.add(reset).clicked() {
-                                self.rate_percent = 0;
-                                self.volume_percent = 0;
+                                self.reset_generation_settings();
                             }
                         });
                     });
@@ -3244,6 +3538,56 @@ impl TtsApp {
                         &mut self.volume_percent,
                         -100..=100,
                     );
+                    if self.tts_engine == TtsEngine::Qwen3Local {
+                        ui.add_space(2.0);
+                        ui.add_enabled_ui(!busy, |ui| {
+                            ui.collapsing(
+                                language.text("Qwen 高级生成参数", "Qwen advanced generation"),
+                                |ui| {
+                                    model_usize_row(ui, language.text("最大生成帧", "Max frames"), &mut self.qwen_max_length, 128..=4_096, "");
+                                    model_f64_row(ui, "Temperature", &mut self.qwen_temperature, 0.0..=2.0, "{:.2}");
+                                    model_usize_row(ui, "Top-K", &mut self.qwen_top_k, 1..=200, "");
+                                    model_f64_row(ui, "Top-P", &mut self.qwen_top_p, 0.01..=1.0, "{:.2}");
+                                    model_f64_row(ui, language.text("重复惩罚", "Repetition penalty"), &mut self.qwen_repetition_penalty, 0.5..=3.0, "{:.2}");
+                                    model_usize_row(ui, language.text("最少生成 token", "Min new tokens"), &mut self.qwen_min_new_tokens, 0..=64, "");
+                                    ui.horizontal(|ui| {
+                                        ui.label(language.text("随机种子", "Seed"));
+                                        ui.checkbox(&mut self.qwen_random_seed, language.text("每次随机", "Random each run"));
+                                        if !self.qwen_random_seed {
+                                            ui.add(egui::DragValue::new(&mut self.qwen_seed).speed(1).range(0..=u64::MAX));
+                                        }
+                                    });
+                                },
+                            );
+                        });
+                    } else if self.tts_engine == TtsEngine::IndexTts25 {
+                        ui.add_space(2.0);
+                        ui.add_enabled_ui(!busy, |ui| {
+                            ui.collapsing(
+                                language.text("IndexTTS-2.5 高级生成参数", "IndexTTS-2.5 advanced generation"),
+                                |ui| {
+                                    model_f64_row(ui, language.text("时长倍率", "Duration factor"), &mut self.indextts_duration_factor, 0.5..=2.0, "{:.2}x");
+                                    ui.checkbox(&mut self.indextts_text_normalization, language.text("文本规范化", "Text normalization"));
+                                    model_usize_row(ui, language.text("每段最大文本 token", "Max text tokens/segment"), &mut self.indextts_max_text_tokens, 16..=512, "");
+                                    model_usize_row(ui, language.text("段间静音", "Silence between segments"), &mut self.indextts_interval_silence_ms, 0..=5_000, " ms");
+                                    ui.checkbox(&mut self.indextts_use_random, language.text("随机情绪参考", "Random emotion reference"));
+                                    model_f64_row(ui, language.text("情绪强度", "Emotion strength"), &mut self.indextts_emo_alpha, 0.0..=1.0, "{:.2}");
+                                    ui.checkbox(&mut self.indextts_use_emo_text, language.text("使用情绪文字", "Use emotion text"));
+                                    if self.indextts_use_emo_text {
+                                        ui.add(egui::TextEdit::singleline(&mut self.indextts_emo_text).hint_text(language.text("例如：开心、温柔地说", "e.g. speak happily and warmly")).desired_width(ui.available_width()));
+                                    }
+                                    ui.checkbox(&mut self.indextts_do_sample, language.text("启用采样", "Enable sampling"));
+                                    model_f64_row(ui, "Temperature", &mut self.indextts_temperature, 0.0..=2.0, "{:.2}");
+                                    model_usize_row(ui, "Top-K", &mut self.indextts_top_k, 1..=200, "");
+                                    model_f64_row(ui, "Top-P", &mut self.indextts_top_p, 0.01..=1.0, "{:.2}");
+                                    model_f64_row(ui, language.text("重复惩罚", "Repetition penalty"), &mut self.indextts_repetition_penalty, 0.1..=20.0, "{:.2}");
+                                    model_f64_row(ui, language.text("长度惩罚", "Length penalty"), &mut self.indextts_length_penalty, -2.0..=2.0, "{:.2}");
+                                    model_usize_row(ui, language.text("Beam 数", "Beam count"), &mut self.indextts_num_beams, 1..=8, "");
+                                    model_usize_row(ui, language.text("最大梅尔 token", "Max mel tokens"), &mut self.indextts_max_mel_tokens, 128..=4_000, "");
+                                },
+                            );
+                        });
+                    }
                 });
 
             ui.add_space(layout.section_gap);
@@ -3433,24 +3777,33 @@ impl TtsApp {
             } else if self.indextts_model_preparing {
                 language.text("准备中", "preparing")
             } else {
-                language.text("待下载", "not downloaded")
+                language.text("待准备", "not prepared")
             };
             ui.horizontal(|ui| {
                 let gap = ui.spacing().item_spacing.x;
                 let button_width = if language == UiLanguage::Chinese {
-                    104.0
+                    92.0
                 } else {
-                    116.0
+                    104.0
                 };
                 let directory_width = if language == UiLanguage::Chinese {
                     76.0
                 } else {
                     94.0
                 };
+                let import_width = if language == UiLanguage::Chinese {
+                    84.0
+                } else {
+                    102.0
+                };
                 let summary = format!("IndexTTS-2.5 · v2.5.0 · {state}");
                 ui.add_sized(
                     egui::vec2(
-                        (ui.available_width() - button_width - directory_width - gap * 2.0)
+                        (ui.available_width()
+                            - button_width
+                            - directory_width
+                            - import_width
+                            - gap * 3.0)
                             .max(80.0),
                         layout.metadata_height,
                     ),
@@ -3491,6 +3844,19 @@ impl TtsApp {
                 if ui.add_enabled(!busy, prepare).clicked() {
                     self.prepare_indextts_model();
                 }
+                let import = egui::Button::new(
+                    egui::RichText::new(language.text("离线导入", "Offline import"))
+                        .size(11.0)
+                        .strong()
+                        .color(PRIMARY),
+                )
+                .fill(EDITOR_BACKGROUND)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(5)
+                .min_size(egui::vec2(import_width, layout.metadata_height));
+                if ui.add_enabled(!busy, import).clicked() {
+                    self.import_indextts_model();
+                }
             });
             if self.indextts_model_preparing {
                 if let Some(progress) = self.indextts_model_progress {
@@ -3509,155 +3875,158 @@ impl TtsApp {
                     });
                 }
             }
-            return;
         }
 
-        let kind = QwenModelKind::VoiceClone;
-        let state = if self.qwen_model_ready == Some((self.selected_qwen_version, kind)) {
-            self.qwen_device.as_deref().unwrap_or("local")
-        } else if self.qwen_model_preparing {
-            language.text("准备中", "preparing")
-        } else {
-            language.text("待加载", "not loaded")
-        };
-        let summary = match language {
-            UiLanguage::Chinese => format!(
-                "{} Base · {state}{}",
-                self.selected_qwen_version.short_label(),
-                if self.selected_qwen_version == QwenModelVersion::Large1_7B {
-                    " · 需更大统一内存"
+        if self.tts_engine != TtsEngine::IndexTts25 {
+            let kind = QwenModelKind::VoiceClone;
+            let state = if self.qwen_model_ready == Some((self.selected_qwen_version, kind)) {
+                self.qwen_device.as_deref().unwrap_or("local")
+            } else if self.qwen_model_preparing {
+                language.text("准备中", "preparing")
+            } else {
+                language.text("待加载", "not loaded")
+            };
+            let summary = match language {
+                UiLanguage::Chinese => format!(
+                    "{} Base · {state}{}",
+                    self.selected_qwen_version.short_label(),
+                    if self.selected_qwen_version == QwenModelVersion::Large1_7B {
+                        " · 需更大统一内存"
+                    } else {
+                        " · 推荐"
+                    }
+                ),
+                UiLanguage::English => format!(
+                    "{} Base · {state}{}",
+                    self.selected_qwen_version.short_label(),
+                    if self.selected_qwen_version == QwenModelVersion::Large1_7B {
+                        " · more unified memory"
+                    } else {
+                        " · recommended"
+                    }
+                ),
+            };
+            ui.horizontal(|ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let import_width = if language == UiLanguage::Chinese {
+                    96.0
                 } else {
-                    " · 推荐"
-                }
-            ),
-            UiLanguage::English => format!(
-                "{} Base · {state}{}",
-                self.selected_qwen_version.short_label(),
-                if self.selected_qwen_version == QwenModelVersion::Large1_7B {
-                    " · more unified memory"
+                    104.0
+                };
+                let directory_width = if language == UiLanguage::Chinese {
+                    76.0
                 } else {
-                    " · recommended"
-                }
-            ),
-        };
-        ui.horizontal(|ui| {
-            let gap = ui.spacing().item_spacing.x;
-            let import_width = if language == UiLanguage::Chinese {
-                96.0
-            } else {
-                104.0
-            };
-            let directory_width = if language == UiLanguage::Chinese {
-                76.0
-            } else {
-                82.0
-            };
-            let download_width = if language == UiLanguage::Chinese {
-                72.0
-            } else {
-                78.0
-            };
-            let selected_model_ready = self.qwen_model_ready
-                == Some((self.selected_qwen_version, QwenModelKind::VoiceClone));
-            let summary_width = (ui.available_width()
-                - import_width
-                - directory_width
-                - download_width
-                - 30.0
-                - gap * 4.0)
-                .max(8.0);
-            ui.add_sized(
-                egui::vec2(summary_width, layout.metadata_height),
-                egui::Label::new(
-                    egui::RichText::new(&summary)
-                        .size(11.0)
-                        .color(TEXT_SECONDARY),
-                )
-                .truncate(),
-            )
-            .on_hover_text(language.text(
-                "参考音频、原文、克隆提示和模型均只保留在本机",
-                "Reference audio, text, clone prompt, and model stay on this device",
-            ));
-            if ui
-                .add(model_directory_button(language, directory_width))
-                .clicked()
-            {
-                self.open_model_directory(ModelDirectoryKind::Qwen3);
-            }
-            if ui
-                .add_enabled(
-                    !busy,
-                    model_download_entry_button(
-                        language,
-                        selected_model_ready,
-                        download_width,
-                        layout.metadata_height,
-                    ),
-                )
-                .on_hover_text(if selected_model_ready {
-                    language.text(
-                        "删除所选模型缓存并重新下载",
-                        "Delete and download the selected model again",
+                    82.0
+                };
+                let download_width = if language == UiLanguage::Chinese {
+                    72.0
+                } else {
+                    78.0
+                };
+                let selected_model_ready = self.qwen_model_ready
+                    == Some((self.selected_qwen_version, QwenModelKind::VoiceClone));
+                let summary_width = (ui.available_width()
+                    - import_width
+                    - directory_width
+                    - download_width
+                    - 30.0
+                    - gap * 4.0)
+                    .max(8.0);
+                ui.add_sized(
+                    egui::vec2(summary_width, layout.metadata_height),
+                    egui::Label::new(
+                        egui::RichText::new(&summary)
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
                     )
-                } else {
-                    language.text(
-                        "下载模型；存在断点文件时从已有进度继续",
-                        "Download the model, resuming any partial files",
-                    )
-                })
-                .clicked()
-            {
-                if selected_model_ready {
-                    self.redownload_selected_qwen_model();
-                } else {
-                    self.prepare_selected_qwen_model();
+                    .truncate(),
+                )
+                .on_hover_text(language.text(
+                    "参考音频、原文、克隆提示和模型均只保留在本机",
+                    "Reference audio, text, clone prompt, and model stay on this device",
+                ));
+                if ui
+                    .add(model_directory_button(language, directory_width))
+                    .clicked()
+                {
+                    self.open_model_directory(ModelDirectoryKind::Qwen3);
                 }
-            }
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("?").size(12.0).strong().color(PRIMARY))
+                if ui
+                    .add_enabled(
+                        !busy,
+                        model_download_entry_button(
+                            language,
+                            selected_model_ready,
+                            download_width,
+                            layout.metadata_height,
+                        ),
+                    )
+                    .on_hover_text(if selected_model_ready {
+                        language.text(
+                            "删除所选模型缓存并重新下载",
+                            "Delete and download the selected model again",
+                        )
+                    } else {
+                        language.text(
+                            "下载模型；存在断点文件时从已有进度继续",
+                            "Download the model, resuming any partial files",
+                        )
+                    })
+                    .clicked()
+                {
+                    if selected_model_ready {
+                        self.redownload_selected_qwen_model();
+                    } else {
+                        self.prepare_selected_qwen_model();
+                    }
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("?").size(12.0).strong().color(PRIMARY),
+                        )
                         .fill(EDITOR_BACKGROUND)
                         .stroke(egui::Stroke::new(1.0, BORDER))
                         .corner_radius(8)
                         .min_size(egui::vec2(30.0, layout.metadata_height)),
+                    )
+                    .on_hover_text(language.text(
+                        "查看 Base 离线模型下载说明",
+                        "Show Base model download instructions",
+                    ))
+                    .clicked()
+                {
+                    self.qwen_manual_help_open = true;
+                }
+                let import = egui::Button::new(
+                    egui::RichText::new(language.text("＋ 离线模型", "+ Offline model"))
+                        .size(11.0)
+                        .strong()
+                        .color(PRIMARY),
                 )
-                .on_hover_text(language.text(
-                    "查看 Base 离线模型下载说明",
-                    "Show Base model download instructions",
+                .fill(PRIMARY_SOFT)
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(205, 214, 255),
                 ))
-                .clicked()
+                .corner_radius(8)
+                .min_size(egui::vec2(import_width, layout.metadata_height));
+                if ui.add_enabled(!busy, import).clicked() {
+                    self.import_selected_qwen_model();
+                }
+            });
+            if self.qwen_model_preparing
+                && let Some(progress) = self.qwen_model_progress
             {
-                self.qwen_manual_help_open = true;
+                ui.add(model_download_progress_bar(
+                    progress,
+                    format!(
+                        "{} · {}",
+                        language.text("本地模型", "Local model"),
+                        self.qwen_model_progress_label
+                    ),
+                ));
             }
-            let import = egui::Button::new(
-                egui::RichText::new(language.text("＋ 离线模型", "+ Offline model"))
-                    .size(11.0)
-                    .strong()
-                    .color(PRIMARY),
-            )
-            .fill(PRIMARY_SOFT)
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgb(205, 214, 255),
-            ))
-            .corner_radius(8)
-            .min_size(egui::vec2(import_width, layout.metadata_height));
-            if ui.add_enabled(!busy, import).clicked() {
-                self.import_selected_qwen_model();
-            }
-        });
-        if self.qwen_model_preparing
-            && let Some(progress) = self.qwen_model_progress
-        {
-            ui.add(model_download_progress_bar(
-                progress,
-                format!(
-                    "{} · {}",
-                    language.text("本地模型", "Local model"),
-                    self.qwen_model_progress_label
-                ),
-            ));
         }
     }
 
@@ -5138,6 +5507,66 @@ fn adjustment_row(
     });
 }
 
+fn model_f64_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    suffix_format: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [132.0, 22.0],
+            egui::Label::new(egui::RichText::new(label).size(11.0).color(TEXT_SECONDARY)),
+        );
+        let slider_width = (ui.available_width() - 66.0).max(64.0);
+        ui.add_sized(
+            [slider_width, 22.0],
+            egui::Slider::new(value, range)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        let display = match suffix_format {
+            "{:.2}x" => format!("{value:.2}x"),
+            _ => format!("{value:.2}"),
+        };
+        ui.add_sized(
+            [58.0, 22.0],
+            egui::Label::new(egui::RichText::new(display).size(11.0).color(TEXT_PRIMARY)),
+        );
+    });
+}
+
+fn model_usize_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut usize,
+    range: std::ops::RangeInclusive<usize>,
+    suffix: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [132.0, 22.0],
+            egui::Label::new(egui::RichText::new(label).size(11.0).color(TEXT_SECONDARY)),
+        );
+        let slider_width = (ui.available_width() - 66.0).max(64.0);
+        ui.add_sized(
+            [slider_width, 22.0],
+            egui::Slider::new(value, range)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        ui.add_sized(
+            [58.0, 22.0],
+            egui::Label::new(
+                egui::RichText::new(format!("{}{suffix}", *value))
+                    .size(11.0)
+                    .color(TEXT_PRIMARY),
+            ),
+        );
+    });
+}
+
 fn paint_preview_waveform(ui: &egui::Ui, rect: egui::Rect, active: bool) {
     const LEVELS: &[f32] = &[
         0.24, 0.42, 0.68, 0.48, 0.82, 0.58, 1.0, 0.72, 0.44, 0.76, 0.54, 0.88, 0.6, 0.38, 0.22,
@@ -5300,6 +5729,8 @@ fn spawn_tts_worker() -> (
                             voice,
                             rate_percent,
                             volume_percent,
+                            qwen_settings,
+                            indextts_settings,
                         } => match voice {
                             VoiceSelection::Edge(voice) => {
                                 preview_voice(
@@ -5322,6 +5753,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    qwen_settings,
                                 )
                                 .await;
                             }
@@ -5335,6 +5767,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    qwen_settings,
                                 )
                                 .await;
                             }
@@ -5351,6 +5784,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    indextts_settings,
                                 )
                                 .await;
                             }
@@ -5360,6 +5794,8 @@ fn spawn_tts_worker() -> (
                             voice,
                             rate_percent,
                             volume_percent,
+                            qwen_settings,
+                            indextts_settings,
                             output_path,
                         } => match voice {
                             VoiceSelection::Edge(voice) => {
@@ -5384,6 +5820,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    qwen_settings,
                                     output_path,
                                 )
                                 .await;
@@ -5399,6 +5836,7 @@ fn spawn_tts_worker() -> (
                                     QwenOutputSettings {
                                         rate_percent,
                                         volume_percent,
+                                        qwen_settings,
                                         output_path,
                                     },
                                 )
@@ -5417,6 +5855,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    indextts_settings,
                                     output_path,
                                 )
                                 .await;
@@ -5427,6 +5866,8 @@ fn spawn_tts_worker() -> (
                             voice,
                             rate_percent,
                             volume_percent,
+                            qwen_settings,
+                            indextts_settings,
                             output_path,
                         } => match voice {
                             VoiceSelection::Edge(voice) => {
@@ -5451,6 +5892,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    qwen_settings,
                                     output_path,
                                 )
                                 .await;
@@ -5466,6 +5908,7 @@ fn spawn_tts_worker() -> (
                                     QwenOutputSettings {
                                         rate_percent,
                                         volume_percent,
+                                        qwen_settings,
                                         output_path,
                                     },
                                 )
@@ -5484,6 +5927,7 @@ fn spawn_tts_worker() -> (
                                     selection,
                                     rate_percent,
                                     volume_percent,
+                                    indextts_settings,
                                     output_path,
                                 )
                                 .await;
@@ -5527,6 +5971,18 @@ fn spawn_tts_worker() -> (
                                 &thread_event_tx,
                                 version,
                                 kind,
+                            );
+                        }
+                        WorkerCommand::ImportIndexTtsModel { source_dir } => {
+                            whisper_model = None;
+                            qwen_clone_prompt = None;
+                            if qwen_model.take().is_some() {
+                                let _ = thread_event_tx.send(WorkerEvent::QwenModelReleased);
+                            }
+                            import_indextts_model_locally(
+                                &indextts_runtime,
+                                &thread_event_tx,
+                                &source_dir,
                             );
                         }
                         WorkerCommand::PrepareIndexTts => {
@@ -5691,6 +6147,42 @@ fn prepare_indextts_runtime(
     }
 }
 
+fn import_indextts_model_locally(
+    runtime: &Result<IndexTtsRuntime, String>,
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    source_dir: &Path,
+) {
+    let runtime = match runtime.as_ref() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::IndexTtsImportFailed(error.clone()));
+            return;
+        }
+    };
+    let progress_tx = event_tx.clone();
+    match runtime.import_offline_model(source_dir, move |progress| {
+        if let IndexTtsProgress::ModelDownload {
+            phase,
+            downloaded_bytes,
+            total_bytes,
+        } = progress
+        {
+            let _ = progress_tx.send(WorkerEvent::IndexTtsImportProgress {
+                phase,
+                copied_bytes: downloaded_bytes,
+                total_bytes,
+            });
+        }
+    }) {
+        Ok(model_dir) => {
+            let _ = event_tx.send(WorkerEvent::IndexTtsImported { model_dir });
+        }
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::IndexTtsImportFailed(error));
+        }
+    }
+}
+
 fn ensure_indextts_ready<'a>(
     runtime: &'a Result<IndexTtsRuntime, String>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -5734,15 +6226,16 @@ fn synthesize_indextts_batch(
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
     texts: &[String],
     selection: &IndexTtsSelection,
-    rate_percent: i32,
+    _rate_percent: i32,
+    settings: IndexTtsSettings,
     subtitle_progress: bool,
 ) -> Result<Vec<Vec<f32>>, String> {
     let runtime = ensure_indextts_ready(runtime, event_tx)?;
     let progress_tx = event_tx.clone();
-    runtime.synthesize_batch(
+    runtime.synthesize_batch_with_settings(
         texts,
         &selection.reference_path,
-        rate_percent,
+        &settings,
         move |progress| match progress {
             IndexTtsProgress::Inference { current, total } if subtitle_progress => {
                 let _ = progress_tx.send(WorkerEvent::SubtitleProgress { current, total });
@@ -5765,6 +6258,7 @@ async fn preview_indextts_voice(
     selection: IndexTtsSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: IndexTtsSettings,
 ) {
     let mut batches = match synthesize_indextts_batch(
         runtime,
@@ -5772,6 +6266,7 @@ async fn preview_indextts_voice(
         &[text],
         &selection,
         rate_percent,
+        settings,
         false,
     ) {
         Ok(batches) => batches,
@@ -5795,6 +6290,7 @@ async fn preview_indextts_voice(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_indextts_mp3(
     runtime: &Result<IndexTtsRuntime, String>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -5802,6 +6298,7 @@ async fn generate_indextts_mp3(
     selection: IndexTtsSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: IndexTtsSettings,
     output_path: PathBuf,
 ) {
     let mut batches = match synthesize_indextts_batch(
@@ -5810,6 +6307,7 @@ async fn generate_indextts_mp3(
         &[text],
         &selection,
         rate_percent,
+        settings,
         false,
     ) {
         Ok(batches) => batches,
@@ -5848,6 +6346,7 @@ async fn generate_indextts_mp3(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_indextts_subtitle_mp3(
     runtime: &Result<IndexTtsRuntime, String>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -5855,6 +6354,7 @@ async fn generate_indextts_subtitle_mp3(
     selection: IndexTtsSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: IndexTtsSettings,
     output_path: PathBuf,
 ) {
     if cues.is_empty() {
@@ -5870,6 +6370,7 @@ async fn generate_indextts_subtitle_mp3(
         &texts,
         &selection,
         rate_percent,
+        settings,
         true,
     ) {
         Ok(clips) => clips,
@@ -6105,8 +6606,9 @@ fn synthesize_qwen_pcm(
     language: QwenSynthesisLanguage,
     rate_percent: i32,
     volume_percent: i32,
+    settings: QwenGenerationSettings,
 ) -> Result<Vec<f32>, String> {
-    let audio = model.synthesize(text, voice, language)?;
+    let audio = model.synthesize_with_settings(text, voice, language, settings)?;
     if audio.samples.is_empty() {
         return Err("Qwen3-TTS 没有生成可用的音频采样。".to_owned());
     }
@@ -6182,8 +6684,9 @@ fn synthesize_qwen_clone_pcm(
     language: QwenSynthesisLanguage,
     rate_percent: i32,
     volume_percent: i32,
+    settings: QwenGenerationSettings,
 ) -> Result<Vec<f32>, String> {
-    let audio = model.synthesize_voice_clone(text, prompt, language)?;
+    let audio = model.synthesize_voice_clone_with_settings(text, prompt, language, settings)?;
     if audio.samples.is_empty() {
         return Err("Qwen3-TTS 音色克隆没有生成可用的音频采样。".to_owned());
     }
@@ -6201,6 +6704,7 @@ fn synthesize_qwen_clone_pcm(
     Ok(samples)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn preview_qwen_clone(
     model_cache: &mut Option<LocalQwenModel>,
     prompt_cache: &mut Option<CachedQwenClonePrompt>,
@@ -6209,6 +6713,7 @@ async fn preview_qwen_clone(
     selection: QwenCloneSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: QwenGenerationSettings,
 ) {
     let (model, prompt) =
         match ensure_qwen_clone_context(model_cache, prompt_cache, event_tx, &selection) {
@@ -6226,6 +6731,7 @@ async fn preview_qwen_clone(
         language,
         rate_percent,
         volume_percent,
+        settings,
     ) {
         Ok(samples) => samples,
         Err(error) => {
@@ -6250,6 +6756,7 @@ async fn preview_qwen_voice(
     selection: QwenSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: QwenGenerationSettings,
 ) {
     let model = match ensure_qwen_model(
         model_cache,
@@ -6271,6 +6778,7 @@ async fn preview_qwen_voice(
         language,
         rate_percent,
         volume_percent,
+        settings,
     ) {
         Ok(samples) => samples,
         Err(error) => {
@@ -6288,6 +6796,7 @@ async fn preview_qwen_voice(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_qwen_mp3(
     model_cache: &mut Option<LocalQwenModel>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -6295,6 +6804,7 @@ async fn generate_qwen_mp3(
     selection: QwenSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: QwenGenerationSettings,
     output_path: PathBuf,
 ) {
     let model = match ensure_qwen_model(
@@ -6331,6 +6841,7 @@ async fn generate_qwen_mp3(
             language,
             rate_percent,
             volume_percent,
+            settings,
         ) {
             Ok(samples) => samples,
             Err(error) => {
@@ -6415,6 +6926,7 @@ async fn generate_qwen_clone_mp3(
             language,
             settings.rate_percent,
             settings.volume_percent,
+            settings.qwen_settings,
         ) {
             Ok(samples) => samples,
             Err(error) => {
@@ -6459,6 +6971,7 @@ async fn generate_qwen_clone_mp3(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_qwen_subtitle_mp3(
     model_cache: &mut Option<LocalQwenModel>,
     event_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -6466,6 +6979,7 @@ async fn generate_qwen_subtitle_mp3(
     selection: QwenSelection,
     rate_percent: i32,
     volume_percent: i32,
+    settings: QwenGenerationSettings,
     output_path: PathBuf,
 ) {
     if cues.is_empty() {
@@ -6518,6 +7032,7 @@ async fn generate_qwen_subtitle_mp3(
             language,
             rate_percent,
             volume_percent,
+            settings,
         ) {
             Ok(clip) => clip,
             Err(error) => {
@@ -6627,6 +7142,7 @@ async fn generate_qwen_clone_subtitle_mp3(
             language,
             settings.rate_percent,
             settings.volume_percent,
+            settings.qwen_settings,
         ) {
             Ok(clip) => clip,
             Err(error) => {
